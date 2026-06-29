@@ -31,6 +31,7 @@ jobs:
               "langchain-google-genai": "genai",
               "langchain-google-vertexai": "vertexai",
               "langchain-google-community": "community",
+              "langchain-google-agent-sandbox": "agent-sandbox",
             };
 
             // All possible package labels we manage

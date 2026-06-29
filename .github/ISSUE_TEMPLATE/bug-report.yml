@@ -22,6 +22,7 @@ body:
         - label: langchain-google-genai
         - label: langchain-google-vertexai
         - label: langchain-google-community
+        - label: langchain-google-agent-sandbox
         - label: Other / not sure / general
 
   - type: checkboxes

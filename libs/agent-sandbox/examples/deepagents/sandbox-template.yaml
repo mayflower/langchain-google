@@ -1,0 +1,11 @@
+apiVersion: agent-sandbox.sigs.k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: python-deepagent
+spec:
+  containers:
+    - name: runtime
+      image: your-registry/deepagents-runtime:latest
+      workingDir: /workspace
+      ports:
+        - containerPort: 8080

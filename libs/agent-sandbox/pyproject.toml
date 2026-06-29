@@ -1,0 +1,131 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = [
+    "/.check-venv",
+    "/.mypy_cache",
+    "/.mypy_cache_examples",
+    "/.mypy_cache_test",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.venv",
+    "/dist",
+    "**/__pycache__",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["langchain_google_agent_sandbox"]
+
+[project]
+name = "langchain-google-agent-sandbox"
+description = "LangChain DeepAgents backend for Kubernetes agent-sandbox runtimes"
+license = {text = "MIT AND Apache-2.0"}
+readme = "README.md"
+authors = []
+version = "0.1.0"
+requires-python = ">=3.11.0,<4.0.0"
+dependencies = [
+    "deepagents>=0.6.12,<0.8.0",
+    "k8s-agent-sandbox>=0.5.0,<1.0.0",
+]
+
+[project.urls]
+Homepage = "https://docs.langchain.com/oss/python/integrations/providers/google"
+Documentation = "https://reference.langchain.com/python/integrations/langchain_google_agent_sandbox/"
+Source = "https://github.com/langchain-ai/langchain-google/tree/master/libs/agent-sandbox"
+Changelog = "https://github.com/langchain-ai/langchain-google/releases?q=%22agent-sandbox%22"
+Twitter = "https://x.com/LangChainAI"
+Slack = "https://www.langchain.com/join-community"
+Reddit = "https://www.reddit.com/r/LangChain/"
+
+[dependency-groups]
+lint = ["ruff>=0.13.1,<0.16.0"]
+typing = ["mypy>=1.18.1,<2.2.0"]
+test = [
+    "pytest>=8.4.0,<10.0.0",
+    "pytest-asyncio>=0.21.0,<2.0.0",
+    "pytest-socket>=0.7.0,<1.0.0",
+    "pytest-timeout>=2.3.1,<3.0.0",
+]
+test_integration = []
+
+[tool.ruff]
+fix = true
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "ANN401",
+    "ANN",
+    "ARG",
+    "ASYNC",
+    "A",
+    "BLE",
+    "B008",
+    "COM812",
+    "C90",
+    "CPY",
+    "D",
+    "DOC",
+    "DTZ",
+    "E501",
+    "EM",
+    "FAST",
+    "FBT",
+    "FIX002",
+    "G",
+    "ISC001",
+    "PLC0415",
+    "PTH",
+    "PYI",
+    "PLR09",
+    "PLR2004",
+    "PT",
+    "S",
+    "SIM",
+    "SLF",
+    "TC001",
+    "TC002",
+    "TC003",
+    "TRY",
+]
+unfixable = ["B028"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D1", "S", "SLF", "ARG001", "PGH003", "PLR2004"]
+"examples/**" = ["INP", "T201"]
+"scripts/**" = ["INP", "S"]
+
+[tool.mypy]
+strict = true
+disallow_any_generics = false
+warn_return_any = false
+
+[[tool.mypy.overrides]]
+module = ["deepagents.*", "k8s_agent_sandbox.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "examples.*"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["main", "app"]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config --timeout=30"
+asyncio_mode = "auto"
+markers = [
+    "asyncio: mark tests as requiring asyncio",
+    "compile: mark import-only tests that compile integration dependencies",
+    "integration: mark tests as requiring a configured Kubernetes agent-sandbox runtime",
+]
