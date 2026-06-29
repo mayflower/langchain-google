@@ -24,6 +24,7 @@ import warnings
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, cast
 
 from deepagents.backends.protocol import (
@@ -352,13 +353,10 @@ class AgentSandboxBackend(SandboxBackendProtocol):
 
     def ls(self, path: str) -> LsResult:
         """List directory entries with stable ordering and metadata where present."""
-        sandbox = self._assert_sandbox()
         with self._track_op():
             try:
                 internal_path = self._to_internal(path)
-                entries_raw = sandbox.files.list(
-                    self._to_runtime_relative(internal_path)
-                )
+                entries_raw = self._list_entries_at(internal_path)
             except Exception as error:
                 return LsResult(entries=[], error=f"Cannot list '{path}': {error}")
         entries: list[FileInfo] = []
@@ -841,6 +839,54 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         if path == self._root_dir or path.startswith(self._root_dir + "/"):
             path = path[len(self._root_dir) :]
         return "/" + path.strip("/")
+
+    def _list_entries_at(self, internal_path: str) -> list[Any]:
+        sandbox = self._assert_sandbox()
+        try:
+            runtime_rel = self._to_runtime_relative(internal_path)
+        except ValueError:
+            runtime_rel = None
+        if runtime_rel is not None:
+            return list(sandbox.files.list(runtime_rel))
+
+        command = (
+            f"find -L {shlex.quote(internal_path)} -mindepth 1 -maxdepth 1"
+            f" \\( -type d -printf 'd\\t%s\\t%T@\\t%f\\0' \\)"
+            f" -o \\( -printf 'f\\t%s\\t%T@\\t%f\\0' \\)"
+        )
+        run_kwargs: dict[str, Any] = {}
+        if self._default_timeout_seconds is not None:
+            run_kwargs["timeout"] = self._default_timeout_seconds
+        result = sandbox.commands.run(command, **run_kwargs)
+        if result.exit_code != 0 and not result.stdout:
+            detail = result.stderr.strip() or f"exit code {result.exit_code}"
+            msg = f"list '{internal_path}' failed: {detail}"
+            raise RuntimeError(msg)
+
+        entries: list[Any] = []
+        for record in result.stdout.split("\x00"):
+            if not record:
+                continue
+            split = record.split("\t", 3)
+            if len(split) != 4:
+                continue
+            type_char, size_str, mod_str, name = split
+            if type_char not in {"d", "f"}:
+                continue
+            metadata: dict[str, Any] = {
+                "name": name,
+                "type": "directory" if type_char == "d" else "file",
+            }
+            try:
+                metadata["size"] = int(size_str)
+            except ValueError:
+                pass
+            try:
+                metadata["mod_time"] = float(mod_str)
+            except ValueError:
+                pass
+            entries.append(SimpleNamespace(**metadata))
+        return entries
 
     def _write_bytes_at(self, internal_path: str, payload: bytes) -> None:
         sandbox = self._assert_sandbox()

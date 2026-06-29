@@ -189,6 +189,32 @@ def test_ls_sorts_filters_and_maps_metadata() -> None:
     assert "2023" in response.entries[1]["modified_at"]
 
 
+def test_ls_uses_shell_fallback_outside_runtime_root() -> None:
+    stdout = (
+        "d\t64\t1700000000\tchild-dir\x00"
+        "f\t5\t1700000001\tfile.txt\x00"
+        "x\t1\t1700000002\tignored\x00"
+    )
+    commands = StubCommands([result(stdout)])
+    files = StubFiles(entries=[FileEntry("should-not-use")])
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(commands=commands, files=files),
+        root_dir="/tmp",
+    )
+
+    response = backend.ls("/")
+
+    assert response.error is None
+    assert files.list_calls == []
+    assert [entry["path"] for entry in response.entries] == [
+        "/child-dir",
+        "/file.txt",
+    ]
+    assert response.entries[0]["is_dir"] is True
+    assert response.entries[1]["size"] == 5
+    assert "find -L /tmp" in commands.calls[0][0]
+
+
 def test_read_window_utf8_errors_and_out_of_range() -> None:
     backend = AgentSandboxBackend.from_existing(
         StubSandbox(files=StubFiles(read=b"zero\none\ntwo"))
@@ -480,3 +506,22 @@ def test_factory_enters_backend_and_finalizer_is_idempotent() -> None:
     backend._finalizer()
     backend._finalizer()
     assert client.deleted == [("claim-1", "ns")]
+
+
+def test_factory_preserves_reattached_backend() -> None:
+    client = StubClient(claims=["claim-old"])
+    factory = create_sandbox_backend_factory(
+        "python",
+        namespace="ns",
+        client=client,
+        session_id="thread-2",
+    )
+
+    backend = factory(SimpleNamespace())
+
+    assert isinstance(backend, AgentSandboxBackend)
+    assert backend.id == "ns/claim-old"
+    assert client.created == []
+    assert not hasattr(backend, "_finalizer")
+    backend.__exit__(None, None, None)
+    assert client.deleted == []

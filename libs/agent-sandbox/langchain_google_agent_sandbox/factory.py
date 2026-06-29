@@ -37,12 +37,13 @@ def create_sandbox_backend_factory(
             **kwargs,
         )
         backend.__enter__()
-        backend._finalizer = weakref.finalize(  # type: ignore[attr-defined]
-            backend,
-            factory_atexit_cleanup,
-            backend._sdk_client,
-            backend._sandbox,
-        )
+        if not backend._reattached:
+            backend._finalizer = weakref.finalize(  # type: ignore[attr-defined]
+                backend,
+                factory_atexit_cleanup,
+                backend._sdk_client,
+                backend._sandbox,
+            )
         return backend
 
     return factory
