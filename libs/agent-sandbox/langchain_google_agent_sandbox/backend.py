@@ -321,7 +321,9 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         """Execute a shell command with ``root_dir`` as the working directory."""
         sandbox = self._assert_sandbox()
         with self._track_op():
-            wrapped = f"sh -c {shlex.quote(f'cd {self._root_dir} && {command}')}"
+            wrapped = (
+                f"sh -c {shlex.quote(f'cd {shlex.quote(self._root_dir)} && {command}')}"
+            )
             effective_timeout = (
                 timeout if timeout is not None else self._default_timeout_seconds
             )
@@ -392,8 +394,9 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 return ReadResult(error=f"Failed to read '{file_path}': {error}")
         try:
             decoded = content.decode("utf-8")
-        except UnicodeDecodeError as error:
-            return ReadResult(error=f"Cannot decode '{file_path}' as UTF-8: {error}")
+        except UnicodeDecodeError:
+            encoded = base64.b64encode(content).decode("ascii")
+            return ReadResult(file_data=FileData(content=encoded, encoding="base64"))
         lines = decoded.splitlines()
         if not lines:
             return ReadResult(file_data=FileData(content="", encoding="utf-8"))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import shlex
 from types import SimpleNamespace
 from typing import Any
 
@@ -156,6 +157,20 @@ def test_execute_combines_streams_and_passes_timeout() -> None:
     assert "cd /workspace" in sandbox.commands.calls[0][0]
 
 
+def test_execute_quotes_custom_root_dir() -> None:
+    sandbox = StubSandbox(commands=StubCommands([result("ok")]))
+    backend = AgentSandboxBackend.from_existing(sandbox, root_dir="/tmp/my root")
+
+    response = backend.execute("echo ok")
+
+    assert response.output == "ok"
+    assert shlex.split(sandbox.commands.calls[0][0]) == [
+        "sh",
+        "-c",
+        "cd '/tmp/my root' && echo ok",
+    ]
+
+
 def test_execute_uses_default_timeout_and_classifies_errors() -> None:
     timeout_backend = AgentSandboxBackend(
         StubSandbox(commands=StubCommands([TimeoutError("slow")])),
@@ -215,7 +230,7 @@ def test_ls_uses_shell_fallback_outside_runtime_root() -> None:
     assert "find -L /tmp" in commands.calls[0][0]
 
 
-def test_read_window_utf8_errors_and_out_of_range() -> None:
+def test_read_window_binary_and_out_of_range() -> None:
     backend = AgentSandboxBackend.from_existing(
         StubSandbox(files=StubFiles(read=b"zero\none\ntwo"))
     )
@@ -223,7 +238,9 @@ def test_read_window_utf8_errors_and_out_of_range() -> None:
     assert "exceeds file length" in backend.read("/x.txt", offset=99).error
 
     bad = AgentSandboxBackend.from_existing(StubSandbox(files=StubFiles(read=b"\xff")))
-    assert "Cannot decode" in bad.read("/bad.bin").error
+    file_data = bad.read("/bad.bin").file_data
+    assert file_data["content"] == "/w=="
+    assert file_data["encoding"] == "base64"
 
 
 def test_write_refuses_existing_and_creates_parent() -> None:
