@@ -47,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--query", "-q")
     parser.add_argument(
-        "--template",
-        default=os.environ.get("LANGCHAIN_SANDBOX_TEMPLATE", "python-deepagent"),
+        "--warm-pool",
+        default=os.environ.get("LANGCHAIN_SANDBOX_WARM_POOL", "python-deepagent-pool"),
     )
     parser.add_argument(
         "--namespace", default=os.environ.get("LANGCHAIN_NAMESPACE", "default")
@@ -56,7 +56,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--root-dir", default=os.environ.get("LANGCHAIN_ROOT_DIR", "/workspace")
     )
-    parser.add_argument("--session-id", default=os.environ.get("LANGCHAIN_SESSION_ID"))
     parser.add_argument("--skills", nargs="*", default=[".deepagents/skills"])
     parser.add_argument("--gateway", default=os.environ.get("LANGCHAIN_GATEWAY_NAME"))
     parser.add_argument(
@@ -100,12 +99,11 @@ def main() -> None:
     args = parse_args()
     model = get_model()
     client = create_client(args)
-    with AgentSandboxBackend.from_template(
+    with AgentSandboxBackend.from_warm_pool(
         client,
-        template_name=args.template,
+        warm_pool=args.warm_pool,
         namespace=args.namespace,
         root_dir=args.root_dir,
-        session_id=args.session_id,
     ) as backend:
         agent = create_deep_agent(model=model, backend=backend, skills=args.skills)
         if args.query:

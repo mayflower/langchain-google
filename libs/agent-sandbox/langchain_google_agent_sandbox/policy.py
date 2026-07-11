@@ -206,6 +206,18 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
             return EditResult(error=deny, path=file_path, occurrences=0)
         return self._backend.edit(file_path, old_string, new_string, replace_all)
 
+    def delete(self, file_path: str) -> WriteResult:
+        """Delete a file when path policy and audit permit it."""
+        if self._is_denied_path(file_path, for_write=True):
+            return WriteResult(
+                error=f"Policy denied: deletes not allowed under '{file_path}'",
+                path=file_path,
+            )
+        deny = self._emit_audit("delete", file_path, {})
+        if deny is not None:
+            return WriteResult(error=deny, path=file_path)
+        return self._backend.delete(file_path)
+
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         if self._is_denied_command(command):
             return ExecuteResponse(

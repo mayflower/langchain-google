@@ -34,9 +34,9 @@ from langchain_google_agent_sandbox import AgentSandboxBackend
 
 client = SandboxClient()
 
-with AgentSandboxBackend.from_template(
+with AgentSandboxBackend.from_warm_pool(
     client,
-    template_name="python-deepagent",
+    warm_pool="python-deepagent-pool",
     namespace="default",
     root_dir="/workspace",
 ) as backend:
@@ -50,6 +50,8 @@ with AgentSandboxBackend.from_template(
 from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
     SandboxPolicyWrapper,
+    SessionAgentSandboxBackend,
+    SessionSandboxEndpoint,
     create_sandbox_backend_factory,
 )
 ```
@@ -62,24 +64,81 @@ Use `from_existing` when another component owns sandbox creation and cleanup.
 backend = AgentSandboxBackend.from_existing(existing_sandbox, root_dir="/workspace")
 ```
 
-## Template Managed Sandboxes
+## Ephemeral Managed Sandboxes
 
-Use `from_template` when this package should create a sandbox on enter and
-delete it on exit.
+Use `from_warm_pool` when this package should create a sandbox on enter and
+delete it on exit. A `SandboxTemplate` defines the runtime; a
+`SandboxWarmPool` is the allocation target used by the SDK. A WarmPool with
+zero replicas provides cold allocation, while a positive replica count enables
+pre-warming.
 
 ```python
-with AgentSandboxBackend.from_template(
+with AgentSandboxBackend.from_warm_pool(
     client,
-    template_name="python-deepagent",
+    warm_pool="python-deepagent-pool",
     namespace="default",
-    session_id="thread-123",
 ) as backend:
     print(backend.id)
 ```
 
-When `session_id` is supplied, the backend looks for exactly one
-`SandboxClaim` with the session label. Multiple matches are refused instead of
-being resolved arbitrarily.
+`from_template` remains as a deprecated compatibility alias for
+`from_warm_pool`.
+
+## Durable Session Backend
+
+Use one `SessionAgentSandboxBackend` instance directly in DeepAgents or as the
+default of a `CompositeBackend`. It reads `configurable.thread_id` from the
+active LangGraph config, HMACs the raw identity with a stable secret, and uses
+the resulting opaque value for the deterministic Claim name and selector
+label. Raw session values are never sent to Kubernetes.
+
+```python
+from deepagents import create_deep_agent
+from k8s_agent_sandbox import SandboxClient
+from langchain_google_agent_sandbox import SessionAgentSandboxBackend
+
+backend = SessionAgentSandboxBackend(
+    SandboxClient(cleanup=False),
+    warm_pool="python-deepagent-pool",
+    namespace="default",
+    session_secret=os.environ["SANDBOX_SESSION_SECRET"],
+    idle_ttl_seconds=3600,
+    renewal_threshold_seconds=600,
+)
+agent = create_deep_agent(model=model, backend=backend)
+
+agent.invoke(
+    {"messages": [("user", "Create report.csv")]},
+    config={"configurable": {"thread_id": "thread-123"}},
+)
+```
+
+For tenant-aware applications, pass a resolver that combines tenant and thread
+identity before HMAC encoding:
+
+```python
+def resolve_session(config):
+    values = config["configurable"]
+    return f"{values['tenant_id']}\0{values['thread_id']}"
+```
+
+The SDK and Kubernetes object uniqueness coordinate get-or-create across
+replicas. Process-local locks only coalesce duplicate calls in one process.
+Closing the backend, completing a graph, or exiting the process closes local
+connectors and does not delete Claims. Use `delete_session(raw_session_id)` for
+explicit deletion. The configured idle TTL is renewed near expiry, while the
+agent-sandbox controller remains the authority that deletes abandoned Claims.
+
+Lifecycle hooks receive only the opaque session ID and the concrete backend:
+
+- `on_session_created`: initialize a genuinely new Claim;
+- `on_session_attached`: observe reattachment without restoring again;
+- `before_session_deleted`: flush state before explicit deletion.
+
+Endpoint-aware integrations can call `get_session_sandbox()`,
+`get_session_claim_name()`, and `get_session_endpoint(port,
+prefer_pod_ip=False)`. An optional legacy-label fallback attaches only when
+exactly one migrated random-name Claim matches; ambiguity fails closed.
 
 ## DeepAgents Factory
 
@@ -91,13 +150,16 @@ from langchain_google_agent_sandbox import create_sandbox_backend_factory
 agent = create_deep_agent(
     model=model,
     backend=create_sandbox_backend_factory(
-        "python-deepagent",
+        "python-deepagent-pool",
         client=SandboxClient(),
         root_dir="/workspace",
-        session_id="thread-123",
     ),
 )
 ```
+
+The callable factory is retained for compatibility with request-scoped agents.
+It creates an ephemeral managed backend and deletes a newly created Claim when
+the backend is finalized. It is not the durable session API.
 
 ## Policy Wrapper
 
@@ -140,7 +202,7 @@ HTTP surface: `/execute`, `/upload`, `/download`, `/list`, and `/exists`.
 Integration tests skip unless explicitly configured.
 
 ```bash
-export LANGCHAIN_SANDBOX_TEMPLATE=python-deepagent
+export LANGCHAIN_SANDBOX_WARM_POOL=python-deepagent-pool
 export LANGCHAIN_NAMESPACE=default
 export LANGCHAIN_API_URL=http://sandbox-router:8080
 make integration_tests
@@ -148,7 +210,7 @@ make integration_tests
 
 Supported environment variables:
 
-- `LANGCHAIN_SANDBOX_TEMPLATE`
+- `LANGCHAIN_SANDBOX_WARM_POOL`
 - `LANGCHAIN_NAMESPACE`
 - `LANGCHAIN_ROOT_DIR`
 - `LANGCHAIN_SERVER_PORT`
@@ -159,13 +221,10 @@ Supported environment variables:
 
 ## Compatibility Notes
 
-This package uses released/public `k8s-agent-sandbox` APIs only. Optional SDK
-conveniences such as labels, `shutdown_after_seconds`, claim listing, and
-template validation are routed through local compatibility helpers. If a
-released SDK lacks a required feature, the backend raises a precise
-`RuntimeError` instead of passing unsupported keyword arguments blindly.
-
-No branch-based or local editable dependency is required.
+This package uses public v1beta1 `k8s-agent-sandbox` APIs only. Claim creation,
+atomic get-or-create, readiness, validation, renewal, deletion, and endpoint
+metadata remain SDK responsibilities. The adapter never issues raw
+`CustomObjectsApi` calls and has no v1alpha1 fallback.
 
 ## Troubleshooting
 

@@ -75,7 +75,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         allow_absolute_paths: bool = False,
         sdk_client: Any | None = None,
         runtime_root: str = "/workspace",
-        _template: str | None = None,
+        _warm_pool: str | None = None,
         _namespace: str = "default",
         _sandbox_ready_timeout: int = 180,
         _labels: dict[str, str] | None = None,
@@ -97,7 +97,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         self._manage_lifecycle = manage_lifecycle
         self._allow_absolute_paths = allow_absolute_paths
         self._sdk_client = sdk_client
-        self._template = _template
+        self._warm_pool = _warm_pool
         self._namespace = _namespace
         self._sandbox_ready_timeout = _sandbox_ready_timeout
         self._labels = _labels
@@ -115,6 +115,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         sandbox: Any,
         root_dir: str = "/workspace",
         allow_absolute_paths: bool = False,
+        runtime_root: str = "/workspace",
+        default_timeout_seconds: int | None = 120,
     ) -> AgentSandboxBackend:
         """Wrap an already-connected sandbox without owning its lifecycle.
 
@@ -128,6 +130,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             allow_absolute_paths: Allow writes outside ``root_dir`` through a
                 shell fallback. This is dangerous and should be reserved for
                 trusted workflows.
+            runtime_root: Root understood by the SDK filesystem API.
+            default_timeout_seconds: Default command timeout.
 
         Returns:
             An unmanaged backend ready for immediate use.
@@ -137,13 +141,15 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             root_dir=root_dir,
             manage_lifecycle=False,
             allow_absolute_paths=allow_absolute_paths,
+            runtime_root=runtime_root,
+            _default_timeout_seconds=default_timeout_seconds,
         )
 
     @classmethod
-    def from_template(
+    def from_warm_pool(
         cls,
         client: Any,
-        template_name: str,
+        warm_pool: str,
         namespace: str = "default",
         root_dir: str = "/workspace",
         allow_absolute_paths: bool = False,
@@ -153,7 +159,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         session_id: str | None = None,
         default_timeout_seconds: int | None = 120,
     ) -> AgentSandboxBackend:
-        """Create a lifecycle-managed backend from a sandbox template.
+        """Create a lifecycle-managed backend from a SandboxWarmPool.
 
         The sandbox is created on ``__enter__`` and deleted on ``__exit__``.
         When ``session_id`` is supplied, ``__enter__`` first searches for an
@@ -163,7 +169,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
 
         Args:
             client: Configured released ``SandboxClient``.
-            template_name: Sandbox template or warm pool name.
+            warm_pool: SandboxWarmPool name.
             namespace: Kubernetes namespace containing the claim.
             root_dir: Virtual root exposed to DeepAgents.
             allow_absolute_paths: Allow writes outside ``root_dir``.
@@ -182,13 +188,46 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             manage_lifecycle=True,
             allow_absolute_paths=allow_absolute_paths,
             sdk_client=client,
-            _template=template_name,
+            _warm_pool=warm_pool,
             _namespace=namespace,
             _sandbox_ready_timeout=sandbox_ready_timeout,
             _labels=labels,
             _shutdown_after_seconds=shutdown_after_seconds,
             _session_id=session_id,
             _default_timeout_seconds=default_timeout_seconds,
+        )
+
+    @classmethod
+    def from_template(
+        cls,
+        client: Any,
+        template_name: str,
+        namespace: str = "default",
+        root_dir: str = "/workspace",
+        allow_absolute_paths: bool = False,
+        sandbox_ready_timeout: int = 180,
+        labels: dict[str, str] | None = None,
+        shutdown_after_seconds: int | None = None,
+        session_id: str | None = None,
+        default_timeout_seconds: int | None = 120,
+    ) -> AgentSandboxBackend:
+        """Deprecated alias for :meth:`from_warm_pool`."""
+        warnings.warn(
+            "from_template() is deprecated; use from_warm_pool()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return cls.from_warm_pool(
+            client,
+            template_name,
+            namespace=namespace,
+            root_dir=root_dir,
+            allow_absolute_paths=allow_absolute_paths,
+            sandbox_ready_timeout=sandbox_ready_timeout,
+            labels=labels,
+            shutdown_after_seconds=shutdown_after_seconds,
+            session_id=session_id,
+            default_timeout_seconds=default_timeout_seconds,
         )
 
     def __enter__(self) -> AgentSandboxBackend:
@@ -207,7 +246,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             labels[self.SESSION_LABEL_KEY] = self._session_id
         self._sandbox = _compat.create_sandbox(
             self._sdk_client,
-            template_name=cast("str", self._template),
+            warm_pool=cast("str", self._warm_pool),
             namespace=self._namespace,
             sandbox_ready_timeout=self._sandbox_ready_timeout,
             labels=labels or None,
@@ -223,6 +262,9 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             while self._inflight > 0:
                 self._inflight_cv.wait()
         if self._reattached:
+            close_connection = getattr(self._sandbox, "close_connection", None)
+            if callable(close_connection):
+                close_connection()
             self._sandbox = None
             return
         claim = getattr(self._sandbox, "claim_name", None)
@@ -288,10 +330,24 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             self._sdk_client,
             claim_name=claims[0],
             namespace=self._namespace,
-            template_name=self._template,
+            warm_pool=self._warm_pool,
         )
         self._reattached = True
         return True
+
+    def close(self) -> None:
+        """Close only the local connector without deleting the Claim."""
+        with self._inflight_cv:
+            self._draining = True
+            while self._inflight > 0:
+                self._inflight_cv.wait()
+        sandbox = self._sandbox
+        self._sandbox = None
+        if sandbox is None:
+            return
+        close_connection = getattr(sandbox, "close_connection", None)
+        if callable(close_connection):
+            close_connection()
 
     @contextmanager
     def _track_op(self) -> Iterator[None]:
@@ -497,6 +553,43 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             path=file_path,
             occurrences=occurrences if replace_all else 1,
         )
+
+    def delete(self, file_path: str) -> WriteResult:
+        """Delete one file without recursively deleting directories."""
+        self._assert_sandbox()
+        with self._track_op():
+            try:
+                internal_path = self._resolve_write_path(file_path)
+            except ValueError as error:
+                return WriteResult(
+                    error=f"Error: Invalid path '{file_path}': {error}",
+                    path=file_path,
+                )
+            state = self._file_state(internal_path)
+            if state == "missing":
+                return WriteResult(
+                    error=f"File '{file_path}' does not exist",
+                    path=file_path,
+                )
+            if state == "dir":
+                return WriteResult(
+                    error=f"Path '{file_path}' is a directory",
+                    path=file_path,
+                )
+            if state != "file":
+                return WriteResult(
+                    error=f"Cannot delete '{file_path}'",
+                    path=file_path,
+                )
+            sandbox = self._assert_sandbox()
+            result = sandbox.commands.run(shlex.join(["rm", "-f", "--", internal_path]))
+            if result.exit_code != 0:
+                detail = result.stderr.strip() or f"exit code {result.exit_code}"
+                return WriteResult(
+                    error=f"Error deleting '{file_path}': {detail}",
+                    path=file_path,
+                )
+        return WriteResult(path=file_path)
 
     def grep(
         self,

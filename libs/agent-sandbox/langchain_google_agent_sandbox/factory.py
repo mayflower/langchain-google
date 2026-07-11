@@ -9,7 +9,7 @@ from langchain_google_agent_sandbox.backend import AgentSandboxBackend
 
 
 def create_sandbox_backend_factory(
-    template_name: str,
+    warm_pool: str,
     namespace: str = "default",
     **kwargs: Any,
 ) -> Callable[[Any], AgentSandboxBackend]:
@@ -21,9 +21,9 @@ def create_sandbox_backend_factory(
     not call ``__exit__`` explicitly.
 
     Args:
-        template_name: Sandbox template or warm pool name.
+        warm_pool: SandboxWarmPool name.
         namespace: Kubernetes namespace.
-        **kwargs: Additional ``AgentSandboxBackend.from_template`` arguments,
+        **kwargs: Additional ``AgentSandboxBackend.from_warm_pool`` arguments,
             including ``client`` and ``session_id``.
 
     Returns:
@@ -31,8 +31,8 @@ def create_sandbox_backend_factory(
     """
 
     def factory(_runtime: Any) -> AgentSandboxBackend:
-        backend = AgentSandboxBackend.from_template(
-            template_name=template_name,
+        backend = AgentSandboxBackend.from_warm_pool(
+            warm_pool=warm_pool,
             namespace=namespace,
             **kwargs,
         )

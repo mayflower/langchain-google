@@ -6,7 +6,7 @@ This example runs a DeepAgent using
 ## Prerequisites
 
 - A Kubernetes cluster with `k8s-agent-sandbox` installed
-- A sandbox template such as `python-deepagent`
+- A v1beta1 `SandboxTemplate` and `SandboxWarmPool`
 - One model provider API key
 
 ```bash
@@ -32,7 +32,7 @@ export GOOGLE_MODEL=gemini-3.5-flash
 Local tunnel:
 
 ```bash
-export LANGCHAIN_SANDBOX_TEMPLATE=python-deepagent
+export LANGCHAIN_SANDBOX_WARM_POOL=python-deepagent-pool
 export LANGCHAIN_USE_TUNNEL=1
 python main.py --query "Create a script that prints hello"
 ```
@@ -43,7 +43,7 @@ Gateway:
 python main.py \
   --gateway external-http-gateway \
   --gateway-namespace default \
-  --template python-deepagent
+  --warm-pool python-deepagent-pool
 ```
 
 Direct API URL:
@@ -51,14 +51,28 @@ Direct API URL:
 ```bash
 python main.py \
   --api-url http://sandbox-router:8080 \
-  --template python-deepagent
+  --warm-pool python-deepagent-pool
 ```
 
-## Session Reattach
+## Durable Sessions
 
-```bash
-python main.py --session-id thread-123 --query "Create data.csv"
-python main.py --session-id thread-123 --query "Read data.csv"
+Use one long-lived backend instance and pass the LangGraph thread ID in each
+run config. The secret must remain stable across replicas and restarts.
+
+```python
+from langchain_google_agent_sandbox import SessionAgentSandboxBackend
+
+backend = SessionAgentSandboxBackend(
+    client,
+    "python-deepagent-pool",
+    session_secret=os.environ["SANDBOX_SESSION_SECRET"],
+    idle_ttl_seconds=3600,
+)
+agent = create_deep_agent(model=model, backend=backend)
+agent.invoke(
+    {"messages": [("user", "Create data.csv")]},
+    config={"configurable": {"thread_id": "thread-123"}},
+)
 ```
 
 ## Policy Wrapper
@@ -79,7 +93,7 @@ runtime, and node configuration.
 
 ## Troubleshooting
 
-- Missing template: check `kubectl get sandboxtemplates -A`.
-- Session reattach ambiguity: delete stale claims with the same session label.
+- Missing WarmPool: check `kubectl get sandboxwarmpools -A`.
+- Legacy session reattach refuses multiple Claims with the same opaque label.
 - Model errors: confirm the selected provider package and API key are installed.
 - Filesystem errors: make sure the runtime exposes writable `/workspace`.

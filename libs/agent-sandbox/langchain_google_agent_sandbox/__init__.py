@@ -5,6 +5,11 @@ from importlib import metadata
 from langchain_google_agent_sandbox.backend import AgentSandboxBackend
 from langchain_google_agent_sandbox.factory import create_sandbox_backend_factory
 from langchain_google_agent_sandbox.policy import SandboxPolicyWrapper
+from langchain_google_agent_sandbox.session_backend import (
+    SessionAgentSandboxBackend,
+    SessionSandboxEndpoint,
+    default_session_resolver,
+)
 
 try:
     __version__ = metadata.version(__package__ or "langchain-google-agent-sandbox")
@@ -14,6 +19,9 @@ except metadata.PackageNotFoundError:
 __all__ = [
     "AgentSandboxBackend",
     "SandboxPolicyWrapper",
+    "SessionAgentSandboxBackend",
+    "SessionSandboxEndpoint",
     "__version__",
     "create_sandbox_backend_factory",
+    "default_session_resolver",
 ]

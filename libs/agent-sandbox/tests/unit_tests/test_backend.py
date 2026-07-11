@@ -89,6 +89,15 @@ class StubSandbox:
         self.files = files or StubFiles()
         self.claim_name = claim_name
         self.namespace = namespace
+        self.sandbox_id = claim_name or "sandbox-id"
+        self.service_host = f"{self.sandbox_id}.{namespace}.svc.cluster.local"
+        self.closed = False
+
+    def get_pod_ip(self) -> str:
+        return "10.0.0.8"
+
+    def close_connection(self) -> None:
+        self.closed = True
 
 
 class StubClient:
@@ -131,6 +140,9 @@ class StubClient:
         self.sandbox.namespace = namespace
         return self.sandbox
 
+    def get_sandbox_claim_warmpool_name(self, claim_name: str, namespace: str) -> str:
+        return "python"
+
     def delete_sandbox(self, claim_name: str, namespace: str = "default") -> None:
         self.deleted.append((claim_name, namespace))
 
@@ -169,6 +181,19 @@ def test_execute_quotes_custom_root_dir() -> None:
         "-c",
         "cd '/tmp/my root' && echo ok",
     ]
+
+
+def test_from_existing_exposes_runtime_root_and_default_timeout() -> None:
+    sandbox = StubSandbox(commands=StubCommands([result("ok")]))
+    backend = AgentSandboxBackend.from_existing(
+        sandbox,
+        root_dir="/app/workspace",
+        runtime_root="/app",
+        default_timeout_seconds=17,
+    )
+    backend.execute("pwd")
+    assert sandbox.commands.calls[0][1]["timeout"] == 17
+    assert backend._runtime_root == "/app"
 
 
 def test_execute_uses_default_timeout_and_classifies_errors() -> None:
@@ -274,6 +299,17 @@ def test_edit_occurrence_rules() -> None:
     assert files.write_calls == [("x", b"baz bar baz")]
 
 
+def test_delete_file_and_refuse_directory() -> None:
+    commands = StubCommands([result()])
+    backend = AgentSandboxBackend.from_existing(StubSandbox(commands=commands))
+    backend._file_state = lambda path: "file"
+    assert backend.delete("/x.txt").error is None
+    assert "rm -f -- /workspace/x.txt" in commands.calls[0][0]
+
+    backend._file_state = lambda path: "dir"
+    assert "directory" in backend.delete("/dir").error
+
+
 def test_upload_and_download_partial_success(monkeypatch: pytest.MonkeyPatch) -> None:
     files = StubFiles(read=b"payload")
     backend = AgentSandboxBackend.from_existing(StubSandbox(files=files))
@@ -340,7 +376,7 @@ def test_grep_glob_and_malformed_output() -> None:
 
 def test_lifecycle_create_delete_reattach_and_refusals() -> None:
     client = StubClient()
-    backend = AgentSandboxBackend.from_template(
+    backend = AgentSandboxBackend.from_warm_pool(
         client,
         "python",
         namespace="ns",
@@ -356,19 +392,19 @@ def test_lifecycle_create_delete_reattach_and_refusals() -> None:
     assert client.deleted == [("claim-1", "ns")]
 
     client = StubClient(claims=["claim-old"])
-    with AgentSandboxBackend.from_template(
+    with AgentSandboxBackend.from_warm_pool(
         client, "python", namespace="ns", session_id="s1"
     ) as value:
         assert value.id == "ns/claim-old"
     assert client.deleted == []
 
     with pytest.raises(RuntimeError, match="Refusing to reattach"):
-        AgentSandboxBackend.from_template(
+        AgentSandboxBackend.from_warm_pool(
             StubClient(claims=["a", "b"]), "python", session_id="s1"
         ).__enter__()
 
     with pytest.raises(RuntimeError, match="not initialized"):
-        AgentSandboxBackend.from_template(StubClient(), "python").execute("pwd")
+        AgentSandboxBackend.from_warm_pool(StubClient(), "python").execute("pwd")
 
 
 def test_drain_rejects_operations_and_cleanup_errors_surface() -> None:
@@ -381,53 +417,44 @@ def test_drain_rejects_operations_and_cleanup_errors_surface() -> None:
         def delete_sandbox(self, claim_name: str, namespace: str = "default") -> None:
             raise RuntimeError("delete failed")
 
-    managed = AgentSandboxBackend.from_template(FailingDeleteClient(), "python")
+    managed = AgentSandboxBackend.from_warm_pool(FailingDeleteClient(), "python")
     managed.__enter__()
     with pytest.raises(RuntimeError, match="delete failed"):
         managed.__exit__(None, None, None)
 
 
-def test_compat_create_does_not_pass_unsupported_kwargs() -> None:
-    class NoLabelsClient:
-        def create_sandbox(self, warmpool: str, namespace: str = "default") -> str:
-            self.kwargs = {"warmpool": warmpool, "namespace": namespace}
+def test_compat_create_uses_v1beta1_sdk_contract() -> None:
+    class Client:
+        def create_sandbox(self, **kwargs: Any) -> str:
+            self.kwargs = kwargs
             return "ok"
 
-    client = NoLabelsClient()
+    client = Client()
     assert (
         _compat.create_sandbox(
             client,
-            template_name="t",
-            namespace="ns",
-            sandbox_ready_timeout=1,
-            labels=None,
-            shutdown_after_seconds=None,
-        )
-        == "ok"
-    )
-    assert client.kwargs == {"warmpool": "t", "namespace": "ns"}
-
-    with pytest.raises(_compat.CompatibilityError, match="labels"):
-        _compat.create_sandbox(
-            client,
-            template_name="t",
+            warm_pool="pool",
             namespace="ns",
             sandbox_ready_timeout=1,
             labels={"a": "b"},
-            shutdown_after_seconds=None,
+            shutdown_after_seconds=30,
         )
+        == "ok"
+    )
+    assert client.kwargs == {
+        "warmpool": "pool",
+        "namespace": "ns",
+        "sandbox_ready_timeout": 1,
+        "labels": {"a": "b"},
+        "shutdown_after_seconds": 30,
+    }
 
 
-def test_compat_falls_back_to_custom_objects_api() -> None:
-    class CustomObjects:
-        def list_namespaced_custom_object(self, **kwargs: Any) -> dict[str, Any]:
-            self.kwargs = kwargs
-            return {"items": [{"metadata": {"name": "claim-a"}}]}
-
-    client = SimpleNamespace(custom_objects_api=CustomObjects())
-    assert _compat.list_sandbox_claims(
-        client, namespace="ns", label_selector="x=y"
-    ) == ["claim-a"]
+def test_compat_requires_public_sdk_list_method() -> None:
+    with pytest.raises(AttributeError):
+        _compat.list_sandbox_claims(
+            SimpleNamespace(), namespace="ns", label_selector="x=y"
+        )
 
 
 def test_langgraph_file_update_noops_without_graph_context() -> None:
@@ -456,16 +483,27 @@ def test_langgraph_file_update_noops_when_langgraph_missing(
 
 
 def test_template_validation_when_metadata_is_available() -> None:
-    sandbox = SimpleNamespace(template_name="other")
+    sandbox = SimpleNamespace()
 
     class Client:
+        def get_sandbox_claim_warmpool_name(
+            self, claim_name: str, namespace: str
+        ) -> str:
+            return "other"
+
         def get_sandbox(self, claim_name: str, namespace: str = "default") -> Any:
             return sandbox
 
     with pytest.raises(ValueError, match="does not match"):
         _compat.get_sandbox(
-            Client(), claim_name="claim", namespace="ns", template_name="wanted"
+            Client(), claim_name="claim", namespace="ns", warm_pool="wanted"
         )
+
+
+def test_from_template_is_deprecated_alias() -> None:
+    with pytest.warns(DeprecationWarning, match="from_warm_pool"):
+        backend = AgentSandboxBackend.from_template(StubClient(), "python")
+    assert isinstance(backend, AgentSandboxBackend)
 
 
 def test_policy_wrapper_blocks_and_audits() -> None:

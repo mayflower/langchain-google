@@ -1,11 +1,25 @@
-apiVersion: agent-sandbox.sigs.k8s.io/v1alpha1
+apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata:
   name: python-deepagent
 spec:
-  containers:
-    - name: runtime
-      image: your-registry/deepagents-runtime:latest
-      workingDir: /workspace
-      ports:
-        - containerPort: 8080
+  service: true
+  podTemplate:
+    spec:
+      containers:
+        - name: runtime
+          image: your-registry/deepagents-runtime:v1
+          workingDir: /workspace
+          ports:
+            - containerPort: 8080
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: python-deepagent-pool
+spec:
+  replicas: 0
+  updateStrategy:
+    type: OnReplenish
+  sandboxTemplateRef:
+    name: python-deepagent

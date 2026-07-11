@@ -12,7 +12,7 @@ from langchain_google_agent_sandbox import (
 
 
 def _configured() -> bool:
-    if not os.environ.get("LANGCHAIN_SANDBOX_TEMPLATE"):
+    if not os.environ.get("LANGCHAIN_SANDBOX_WARM_POOL"):
         return False
     return bool(
         os.environ.get("LANGCHAIN_API_URL")
@@ -49,9 +49,9 @@ def _client():
 
 @pytest.fixture
 def backend():
-    with AgentSandboxBackend.from_template(
+    with AgentSandboxBackend.from_warm_pool(
         _client(),
-        template_name=os.environ["LANGCHAIN_SANDBOX_TEMPLATE"],
+        warm_pool=os.environ["LANGCHAIN_SANDBOX_WARM_POOL"],
         namespace=os.environ.get("LANGCHAIN_NAMESPACE", "default"),
         root_dir=os.environ.get("LANGCHAIN_ROOT_DIR", "/workspace"),
     ) as value:
