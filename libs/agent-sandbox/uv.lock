@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11.0, <4.0.0"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -839,8 +839,8 @@ wheels = [
 
 [[package]]
 name = "k8s-agent-sandbox"
-version = "0.1.dev656+gf25f3226b"
-source = { git = "https://github.com/mayflower/agent-sandbox.git?subdirectory=clients%2Fpython%2Fagentic-sandbox-client&rev=f25f3226b32b8a00e6bc8c916088012ad99e7187#f25f3226b32b8a00e6bc8c916088012ad99e7187" }
+version = "0.1.dev657+ga2419b9b7"
+source = { git = "https://github.com/mayflower/agent-sandbox.git?subdirectory=clients%2Fpython%2Fagentic-sandbox-client&rev=a2419b9b7eaeec99f636c46a46ca55731d3f52fc#a2419b9b7eaeec99f636c46a46ca55731d3f52fc" }
 dependencies = [
     { name = "kubernetes" },
     { name = "prometheus-client" },
@@ -943,7 +943,7 @@ typing = [
 [package.metadata]
 requires-dist = [
     { name = "deepagents", specifier = ">=0.6.12,<0.8.0" },
-    { name = "k8s-agent-sandbox", git = "https://github.com/mayflower/agent-sandbox.git?subdirectory=clients%2Fpython%2Fagentic-sandbox-client&rev=f25f3226b32b8a00e6bc8c916088012ad99e7187" },
+    { name = "k8s-agent-sandbox", git = "https://github.com/mayflower/agent-sandbox.git?subdirectory=clients%2Fpython%2Fagentic-sandbox-client&rev=a2419b9b7eaeec99f636c46a46ca55731d3f52fc" },
 ]
 
 [package.metadata.requires-dev]
