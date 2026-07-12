@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import builtins
 import shlex
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from k8s_agent_sandbox.exceptions import SandboxNotFoundError
 
 from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
@@ -62,6 +62,8 @@ class StubFiles:
 
     def read(self, path: str) -> bytes | str:
         self.read_calls.append(path)
+        if isinstance(self.read_value, BaseException):
+            raise self.read_value
         return self.read_value
 
     def list(self, path: str) -> list[FileEntry]:
@@ -259,13 +261,26 @@ def test_read_window_binary_and_out_of_range() -> None:
     backend = AgentSandboxBackend.from_existing(
         StubSandbox(files=StubFiles(read=b"zero\none\ntwo"))
     )
-    assert backend.read("/x.txt", offset=1, limit=1).file_data["content"] == "one"
+    assert backend.read("/x.txt", offset=1, limit=1).file_data["content"] == "one\n"
     assert "exceeds file length" in backend.read("/x.txt", offset=99).error
 
     bad = AgentSandboxBackend.from_existing(StubSandbox(files=StubFiles(read=b"\xff")))
     file_data = bad.read("/bad.bin").file_data
     assert file_data["content"] == "/w=="
     assert file_data["encoding"] == "base64"
+
+
+def test_read_preserves_line_endings_and_not_found_errors() -> None:
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(files=StubFiles(read=b"zero\r\none\n"))
+    )
+    assert backend.read("/x.txt").file_data["content"] == "zero\r\none\n"
+
+    missing = AgentSandboxBackend.from_existing(
+        StubSandbox(files=StubFiles(read=SandboxNotFoundError("gone")))
+    )
+    with pytest.raises(SandboxNotFoundError):
+        missing.read("/x.txt")
 
 
 def test_write_refuses_existing_and_creates_parent() -> None:
@@ -310,20 +325,15 @@ def test_delete_file_and_refuse_directory() -> None:
     assert "directory" in backend.delete("/dir").error
 
 
-def test_upload_and_download_partial_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_upload_and_download_partial_success() -> None:
     files = StubFiles(read=b"payload")
     backend = AgentSandboxBackend.from_existing(StubSandbox(files=files))
     backend._file_state = lambda path: "missing" if "ok" in path else "dir"
     backend._dir_state = lambda path: "writable"
-    files_update: dict[str, Any] = {}
-    monkeypatch.setattr(_compat, "send_files_update", files_update.update)
-
     uploads = backend.upload_files(
         [("/ok.txt", b"ok"), ("/ok.bin", b"\xff"), ("/dir", b"bad")]
     )
     assert [item.error for item in uploads] == [None, None, "is_directory"]
-    assert files_update["/ok.txt"]["encoding"] == "utf-8"
-    assert files_update["/ok.bin"]["encoding"] == "base64"
 
     backend._file_state = lambda path: "file" if "ok" in path else "missing"
     downloads = backend.download_files(["/ok.txt", "/missing.txt"])
@@ -457,31 +467,6 @@ def test_compat_requires_public_sdk_list_method() -> None:
         )
 
 
-def test_langgraph_file_update_noops_without_graph_context() -> None:
-    _compat.send_files_update({"x.txt": {"content": "x", "encoding": "utf-8"}})
-
-
-def test_langgraph_file_update_noops_when_langgraph_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    real_import = builtins.__import__
-
-    def fake_import(
-        name: str,
-        globals: dict[str, Any] | None = None,
-        locals: dict[str, Any] | None = None,
-        fromlist: tuple[str, ...] = (),
-        level: int = 0,
-    ) -> Any:
-        if name.startswith("langgraph"):
-            msg = "missing langgraph"
-            raise ModuleNotFoundError(msg)
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-    _compat.send_files_update({"x.txt": {"content": "x", "encoding": "utf-8"}})
-
-
 def test_template_validation_when_metadata_is_available() -> None:
     sandbox = SimpleNamespace()
 
@@ -563,6 +548,20 @@ def test_factory_enters_backend_and_finalizer_is_idempotent() -> None:
     assert client.deleted == [("claim-1", "ns")]
 
 
+def test_factory_finalizer_is_detached_after_explicit_exit() -> None:
+    client = StubClient()
+    backend = create_sandbox_backend_factory("python", namespace="ns", client=client)(
+        SimpleNamespace()
+    )
+    finalizer = backend._finalizer
+
+    backend.__exit__(None, None, None)
+    assert finalizer is not None
+    assert not finalizer.alive
+    finalizer()
+    assert client.deleted == [("claim-1", "ns")]
+
+
 def test_factory_preserves_reattached_backend() -> None:
     client = StubClient(claims=["claim-old"])
     factory = create_sandbox_backend_factory(
@@ -577,6 +576,6 @@ def test_factory_preserves_reattached_backend() -> None:
     assert isinstance(backend, AgentSandboxBackend)
     assert backend.id == "ns/claim-old"
     assert client.created == []
-    assert not hasattr(backend, "_finalizer")
+    assert backend._finalizer is None
     backend.__exit__(None, None, None)
     assert client.deleted == []

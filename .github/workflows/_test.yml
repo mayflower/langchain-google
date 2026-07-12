@@ -57,6 +57,13 @@ jobs:
         run: |
           make test
 
+      - name: Test latest supported DeepAgents release
+        if: ${{ inputs.working-directory == 'libs/agent-sandbox' && matrix.python-version == '3.11' }}
+        shell: bash
+        run: |
+          uv pip install --python .venv/bin/python --upgrade 'deepagents>=0.6.12,<0.8.0'
+          uv run --no-sync --group test pytest --disable-socket --allow-unix-socket tests/unit_tests/
+
       - name: Ensure the tests did not create any additional files
         shell: bash
         run: |

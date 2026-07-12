@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import weakref
 from collections.abc import Callable
 from typing import Any
 
-from langchain_google_agent_sandbox._lifecycle import factory_atexit_cleanup
 from langchain_google_agent_sandbox.backend import AgentSandboxBackend
 
 
@@ -37,13 +35,7 @@ def create_sandbox_backend_factory(
             **kwargs,
         )
         backend.__enter__()
-        if not backend._reattached:
-            backend._finalizer = weakref.finalize(  # type: ignore[attr-defined]
-                backend,
-                factory_atexit_cleanup,
-                backend._sdk_client,
-                backend._sandbox,
-            )
+        backend._register_finalizer()
         return backend
 
     return factory

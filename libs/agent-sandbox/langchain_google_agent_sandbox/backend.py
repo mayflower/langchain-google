@@ -21,6 +21,7 @@ import re
 import shlex
 import threading
 import warnings
+import weakref
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -42,7 +43,7 @@ from deepagents.backends.protocol import (
     SandboxBackendProtocol,
     WriteResult,
 )
-from deepagents.backends.utils import create_file_data
+from k8s_agent_sandbox.exceptions import SandboxNotFoundError
 
 from langchain_google_agent_sandbox import _compat
 from langchain_google_agent_sandbox._compat import SESSION_LABEL_KEY
@@ -108,6 +109,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         self._draining = False
         self._inflight = 0
         self._inflight_cv = threading.Condition(threading.Lock())
+        self._finalizer: weakref.finalize | None = None
 
     @classmethod
     def from_existing(
@@ -257,6 +259,9 @@ class AgentSandboxBackend(SandboxBackendProtocol):
     def __exit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> None:
         if not self._manage_lifecycle or self._sandbox is None:
             return
+        if self._finalizer is not None and self._finalizer.alive:
+            self._finalizer.detach()
+        self._finalizer = None
         with self._inflight_cv:
             self._draining = True
             while self._inflight > 0:
@@ -308,6 +313,19 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         self, exc_type: Any, exc: BaseException | None, tb: Any
     ) -> None:
         self.__exit__(exc_type, exc, tb)
+
+    def _register_finalizer(self) -> None:
+        """Register fallback cleanup for a factory-managed ephemeral Claim."""
+        if self._reattached or self._sandbox is None or self._sdk_client is None:
+            return
+        from langchain_google_agent_sandbox._lifecycle import factory_atexit_cleanup
+
+        self._finalizer = weakref.finalize(
+            self,
+            factory_atexit_cleanup,
+            self._sdk_client,
+            self._sandbox,
+        )
 
     def _try_reattach(self) -> bool:
         if self._sdk_client is None or self._session_id is None:
@@ -388,6 +406,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                     result = sandbox.commands.run(wrapped)
                 else:
                     result = sandbox.commands.run(wrapped, timeout=effective_timeout)
+            except SandboxNotFoundError:
+                raise
             except Exception as error:
                 if is_timeout_exception(error):
                     return ExecuteResponse(
@@ -415,6 +435,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             try:
                 internal_path = self._to_internal(path)
                 entries_raw = self._list_entries_at(internal_path)
+            except SandboxNotFoundError:
+                raise
             except Exception as error:
                 return LsResult(entries=[], error=f"Cannot list '{path}': {error}")
         entries: list[FileInfo] = []
@@ -446,6 +468,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             try:
                 internal_path = self._to_internal(file_path)
                 content = self._read_bytes_at(internal_path)
+            except SandboxNotFoundError:
+                raise
             except Exception as error:
                 return ReadResult(error=f"Failed to read '{file_path}': {error}")
         try:
@@ -453,15 +477,15 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         except UnicodeDecodeError:
             encoded = base64.b64encode(content).decode("ascii")
             return ReadResult(file_data=FileData(content=encoded, encoding="base64"))
-        lines = decoded.splitlines()
-        if not lines:
+        if not decoded:
             return ReadResult(file_data=FileData(content="", encoding="utf-8"))
+        lines = decoded.splitlines(keepends=True)
         start = max(0, offset)
         if start >= len(lines):
             return ReadResult(
                 error=f"Line offset {offset} exceeds file length ({len(lines)} lines)"
             )
-        selected = "\n".join(lines[start : min(len(lines), start + limit)])
+        selected = "".join(lines[start : min(len(lines), start + limit)])
         return ReadResult(file_data=FileData(content=selected, encoding="utf-8"))
 
     def write(self, file_path: str, content: str) -> WriteResult:
@@ -483,13 +507,13 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                     )
                 self._ensure_parent_dir(internal_path)
                 self._write_bytes_at(internal_path, content.encode("utf-8"))
+            except SandboxNotFoundError:
+                raise
             except Exception as error:
                 return WriteResult(
                     error=f"Error writing '{file_path}': {error}",
                     path=file_path,
                 )
-        files_update = {file_path: create_file_data(content)}
-        _compat.send_files_update(files_update)
         return WriteResult(path=file_path)
 
     def edit(
@@ -506,6 +530,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 internal_path = self._resolve_write_path(file_path)
                 raw = self._read_bytes_at(internal_path)
                 content = raw.decode("utf-8")
+            except SandboxNotFoundError:
+                raise
             except UnicodeDecodeError as error:
                 return EditResult(
                     error=f"Error: Cannot edit '{file_path}': not valid UTF-8 ({error})",
@@ -541,14 +567,14 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             )
             try:
                 self._write_bytes_at(internal_path, updated.encode("utf-8"))
+            except SandboxNotFoundError:
+                raise
             except Exception as error:
                 return EditResult(
                     error=f"Error writing '{file_path}': {error}",
                     path=file_path,
                     occurrences=0,
                 )
-        files_update = {file_path: create_file_data(updated)}
-        _compat.send_files_update(files_update)
         return EditResult(
             path=file_path,
             occurrences=occurrences if replace_all else 1,
@@ -616,6 +642,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 run_kwargs["timeout"] = self._default_timeout_seconds
             try:
                 result = sandbox.commands.run(" ".join(parts), **run_kwargs)
+            except SandboxNotFoundError:
+                raise
             except Exception as error:
                 return GrepResult(
                     matches=[],
@@ -684,6 +712,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 run_kwargs["timeout"] = self._default_timeout_seconds
             try:
                 result = sandbox.commands.run(command, **run_kwargs)
+            except SandboxNotFoundError:
+                raise
             except Exception as error:
                 return GlobResult(
                     matches=[],
@@ -772,17 +802,6 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                     )
                     continue
                 responses.append(FileUploadResponse(path=path, error=None))
-        files_update: dict[str, Any] = {}
-        for response, (path, payload) in zip(responses, pairs, strict=True):
-            if response.error is None:
-                try:
-                    text = payload.decode("utf-8")
-                    files_update[path] = create_file_data(text)
-                except UnicodeDecodeError:
-                    text = base64.b64encode(payload).decode("ascii")
-                    files_update[path] = create_file_data(text, encoding="base64")
-        if files_update:
-            _compat.send_files_update(files_update)
         return responses
 
     def download_files(self, paths: Iterable[str]) -> list[FileDownloadResponse]:

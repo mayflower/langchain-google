@@ -94,22 +94,6 @@ def normalize_read_bytes(data: Any) -> bytes:
     raise TypeError(msg)
 
 
-def send_files_update(update: dict[str, Any]) -> None:
-    """Best-effort DeepAgents state["files"] sync through LangGraph context."""
-    try:
-        from langgraph._internal._constants import CONFIG_KEY_SEND
-        from langgraph.config import get_config
-    except (ImportError, ModuleNotFoundError):
-        return
-    try:
-        config = get_config()
-    except RuntimeError:
-        return
-    send = config.get("configurable", {}).get(CONFIG_KEY_SEND)
-    if send is not None:
-        send([("files", update)])
-
-
 def _claim_names(claims: Iterable[Any]) -> list[str]:
     names: list[str] = []
     for claim in claims:

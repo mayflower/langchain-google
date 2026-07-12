@@ -104,6 +104,8 @@ backend = SessionAgentSandboxBackend(
     session_secret=os.environ["SANDBOX_SESSION_SECRET"],
     idle_ttl_seconds=3600,
     renewal_threshold_seconds=600,
+    local_cache_ttl_seconds=300,
+    max_cached_sessions=128,
 )
 agent = create_deep_agent(model=model, backend=backend)
 
@@ -128,6 +130,11 @@ Closing the backend, completing a graph, or exiting the process closes local
 connectors and does not delete Claims. Use `delete_session(raw_session_id)` for
 explicit deletion. The configured idle TTL is renewed near expiry, while the
 agent-sandbox controller remains the authority that deletes abandoned Claims.
+Idle local cache entries close only their process-local connector after
+`local_cache_ttl_seconds`; a later operation reattaches to the existing Claim.
+Set this option to `None` only when the application bounds its session set by
+other means. `max_cached_sessions` additionally applies an LRU-style hard bound
+to process-local connectors without deleting Claims.
 
 Lifecycle hooks receive only the opaque session ID and the concrete backend:
 
@@ -159,7 +166,8 @@ agent = create_deep_agent(
 
 The callable factory is retained for compatibility with request-scoped agents.
 It creates an ephemeral managed backend and deletes a newly created Claim when
-the backend is finalized. It is not the durable session API.
+the backend is explicitly exited or finalized. Explicit exit detaches the
+fallback finalizer. It is not the durable session API.
 
 ## Policy Wrapper
 

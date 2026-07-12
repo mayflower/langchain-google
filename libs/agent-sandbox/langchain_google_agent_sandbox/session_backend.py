@@ -24,8 +24,9 @@ import hmac
 import ipaddress
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from deepagents.backends.protocol import (
@@ -79,6 +80,7 @@ class _SessionEntry:
     sandbox: Any
     claim_name: str
     last_renewed_at: float | None = None
+    last_accessed_at: float = field(default_factory=time.monotonic)
 
 
 def default_session_resolver(config: Mapping[str, Any]) -> str:
@@ -121,6 +123,8 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         idle_ttl_seconds: int | None = None,
         renewal_threshold_seconds: int | None = None,
         default_timeout_seconds: int | None = 120,
+        local_cache_ttl_seconds: int | None = 300,
+        max_cached_sessions: int = 128,
         legacy_label_fallback: bool = False,
         on_session_created: SessionHook | None = None,
         on_session_attached: SessionHook | None = None,
@@ -156,6 +160,14 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         elif renewal_threshold_seconds is not None:
             msg = "renewal_threshold_seconds requires idle_ttl_seconds"
             raise ValueError(msg)
+        if local_cache_ttl_seconds is not None and (
+            type(local_cache_ttl_seconds) is not int or local_cache_ttl_seconds <= 0
+        ):
+            msg = "local_cache_ttl_seconds must be a positive integer or None"
+            raise ValueError(msg)
+        if type(max_cached_sessions) is not int or max_cached_sessions <= 0:
+            msg = "max_cached_sessions must be a positive integer"
+            raise ValueError(msg)
         if labels and self.SESSION_LABEL_KEY in labels:
             msg = f"labels must not override {self.SESSION_LABEL_KEY}"
             raise ValueError(msg)
@@ -173,12 +185,16 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         self._idle_ttl_seconds = idle_ttl_seconds
         self._renewal_threshold_seconds = renewal_threshold_seconds
         self._default_timeout_seconds = default_timeout_seconds
+        self._local_cache_ttl_seconds = local_cache_ttl_seconds
+        self._max_cached_sessions = max_cached_sessions
         self._legacy_label_fallback = legacy_label_fallback
         self._on_session_created = on_session_created
         self._on_session_attached = on_session_attached
         self._before_session_deleted = before_session_deleted
         self._entries: dict[str, _SessionEntry] = {}
-        self._session_locks: dict[str, threading.RLock] = {}
+        self._session_locks: weakref.WeakValueDictionary[str, threading.RLock] = (
+            weakref.WeakValueDictionary()
+        )
         self._cache_lock = threading.RLock()
         self._closed = False
         atexit.register(self.close)
@@ -285,6 +301,7 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
             backend=backend,
             sandbox=sandbox,
             claim_name=claim_name,
+            last_accessed_at=time.monotonic(),
         )
         try:
             self._renew(entry, force=True)
@@ -326,26 +343,78 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         )
         entry.last_renewed_at = now
 
-    def _entry(self, session_id: str | None = None) -> tuple[str, _SessionEntry]:
+    def _evict_idle_entries(self, *, exclude: str | None = None) -> None:
+        ttl = self._local_cache_ttl_seconds
+        with self._cache_lock:
+            entries = list(self._entries.items())
+        cutoff = time.monotonic() - ttl if ttl is not None else None
+        candidates = {
+            opaque_session_id
+            for opaque_session_id, entry in entries
+            if opaque_session_id != exclude
+            and cutoff is not None
+            and entry.last_accessed_at <= cutoff
+        }
+        current_is_cached = any(
+            opaque_session_id == exclude for opaque_session_id, _ in entries
+        )
+        projected_size = len(entries) + (0 if current_is_cached else 1)
+        overflow = max(0, projected_size - self._max_cached_sessions)
+        capacity_candidates: set[str] = set()
+        if overflow:
+            oldest = sorted(
+                (
+                    (entry.last_accessed_at, opaque_session_id)
+                    for opaque_session_id, entry in entries
+                    if opaque_session_id != exclude
+                    and opaque_session_id not in candidates
+                ),
+            )
+            capacity_candidates = {
+                opaque_session_id for _, opaque_session_id in oldest[:overflow]
+            }
+            candidates.update(capacity_candidates)
+        for opaque_session_id in candidates:
+            with self._lock_for(opaque_session_id):
+                with self._cache_lock:
+                    entry = self._entries.get(opaque_session_id)
+                    if entry is None:
+                        continue
+                    if (
+                        cutoff is not None
+                        and opaque_session_id not in capacity_candidates
+                        and entry.last_accessed_at > cutoff
+                    ):
+                        continue
+                    self._entries.pop(opaque_session_id, None)
+                entry.backend.close()
+
+    def _entry_locked(self, opaque_session_id: str) -> _SessionEntry:
         if self._closed:
             msg = "SessionAgentSandboxBackend is closed"
             raise RuntimeError(msg)
+        with self._cache_lock:
+            entry = self._entries.get(opaque_session_id)
+        if entry is not None:
+            try:
+                self._renew(entry)
+                entry.last_accessed_at = time.monotonic()
+                return entry
+            except SandboxNotFoundError:
+                entry.backend.close()
+                with self._cache_lock:
+                    self._entries.pop(opaque_session_id, None)
+        entry = self._acquire(opaque_session_id)
+        entry.last_accessed_at = time.monotonic()
+        with self._cache_lock:
+            self._entries[opaque_session_id] = entry
+        return entry
+
+    def _entry(self, session_id: str | None = None) -> tuple[str, _SessionEntry]:
         opaque_session_id = self.opaque_session_id(session_id)
-        lock = self._lock_for(opaque_session_id)
-        with lock:
-            with self._cache_lock:
-                entry = self._entries.get(opaque_session_id)
-            if entry is not None:
-                try:
-                    self._renew(entry)
-                    return opaque_session_id, entry
-                except SandboxNotFoundError:
-                    entry.backend.close()
-                    with self._cache_lock:
-                        self._entries.pop(opaque_session_id, None)
-            entry = self._acquire(opaque_session_id)
-            with self._cache_lock:
-                self._entries[opaque_session_id] = entry
+        self._evict_idle_entries(exclude=opaque_session_id)
+        with self._lock_for(opaque_session_id):
+            entry = self._entry_locked(opaque_session_id)
             return opaque_session_id, entry
 
     def _invoke(
@@ -354,13 +423,16 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        opaque_session_id, entry = self._entry()
-        try:
-            return getattr(entry.backend, method_name)(*args, **kwargs)
-        except SandboxNotFoundError:
-            self._invalidate(opaque_session_id)
-            _, replacement = self._entry()
-            return getattr(replacement.backend, method_name)(*args, **kwargs)
+        opaque_session_id = self.opaque_session_id()
+        self._evict_idle_entries(exclude=opaque_session_id)
+        with self._lock_for(opaque_session_id):
+            entry = self._entry_locked(opaque_session_id)
+            try:
+                return getattr(entry.backend, method_name)(*args, **kwargs)
+            except SandboxNotFoundError:
+                self._invalidate(opaque_session_id)
+                replacement = self._entry_locked(opaque_session_id)
+                return getattr(replacement.backend, method_name)(*args, **kwargs)
 
     def _invalidate(self, opaque_session_id: str) -> None:
         with self._cache_lock:
@@ -407,6 +479,7 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
             self._closed = True
             entries = list(self._entries.values())
             self._entries.clear()
+        atexit.unregister(self.close)
         for entry in entries:
             entry.backend.close()
 

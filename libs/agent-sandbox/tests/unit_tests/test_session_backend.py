@@ -7,22 +7,32 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend
 from deepagents.backends.protocol import SandboxBackendProtocol
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
 from k8s_agent_sandbox.acquisition import SandboxAcquisition
 from k8s_agent_sandbox.exceptions import SandboxNotFoundError
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage
 
 from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
+    SandboxPolicyWrapper,
     SessionAgentSandboxBackend,
     SessionSandboxEndpoint,
     default_session_resolver,
 )
 from langchain_google_agent_sandbox._compat import SESSION_LABEL_KEY
 from langchain_google_agent_sandbox.session_backend import _SessionEntry
-from tests.unit_tests.test_backend import StubSandbox, result
+from tests.unit_tests.test_backend import StubCommands, StubSandbox, result
+
+
+class ToolCallingFakeModel(FakeMessagesListChatModel):
+    def bind_tools(self, tools: Any, **kwargs: Any) -> ToolCallingFakeModel:
+        del tools, kwargs
+        return self
 
 
 class SessionStubClient:
@@ -239,6 +249,69 @@ def test_idle_ttl_renewal_threshold_and_not_found_reacquire(
     assert client.acquire_count == 2
 
 
+def test_operation_not_found_reacquires_without_waiting_for_renewal() -> None:
+    client = SessionStubClient()
+    backend = make_backend(client, idle_ttl_seconds=None)
+    backend._active_config = lambda: {"configurable": {"thread_id": "operation"}}
+    backend.get_session_claim_name()
+    claim = backend.get_session_claim_name()
+    client.sandboxes[claim].commands = StubCommands([SandboxNotFoundError(claim)])
+
+    response = backend.execute("pwd")
+
+    assert response.exit_code == 0
+    assert client.acquire_count == 2
+
+
+def test_local_cache_evicts_connectors_without_deleting_claims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(
+        "langchain_google_agent_sandbox.session_backend.time.monotonic",
+        lambda: now[0],
+    )
+    client = SessionStubClient()
+    backend = make_backend(client, local_cache_ttl_seconds=10)
+    first_claim = backend.get_session_claim_name("first")
+    first_sandbox = client.sandboxes[first_claim]
+
+    now[0] = 111.0
+    backend.get_session_claim_name("second")
+
+    assert first_sandbox.closed
+    assert first_claim in client.sandboxes
+    assert client.deleted == []
+    assert backend.opaque_session_id("first") not in backend._entries
+
+
+def test_local_cache_is_bounded_without_claim_deletion() -> None:
+    client = SessionStubClient()
+    backend = make_backend(
+        client,
+        local_cache_ttl_seconds=None,
+        max_cached_sessions=1,
+    )
+    first_claim = backend.get_session_claim_name("first")
+    first_sandbox = client.sandboxes[first_claim]
+
+    backend.get_session_claim_name("second")
+
+    assert first_sandbox.closed
+    assert first_claim in client.sandboxes
+    assert len(backend._entries) == 1
+    assert client.deleted == []
+
+
+def test_policy_wrapper_accepts_session_backend() -> None:
+    backend = make_backend()
+    backend._active_config = lambda: {"configurable": {"thread_id": "policy"}}
+    wrapped = SandboxPolicyWrapper(backend, deny_prefixes=["/etc"])
+
+    assert wrapped.write("/etc/passwd", "blocked").error.startswith("Policy denied")
+    assert wrapped.write("/allowed.txt", "ok").error is None
+
+
 def test_created_attached_delete_hooks_and_close_semantics() -> None:
     client = SessionStubClient()
     events: list[tuple[str, str]] = []
@@ -361,3 +434,37 @@ def test_direct_composite_and_middleware_integration() -> None:
     assert composite.default is backend
     assert FilesystemMiddleware(backend=backend)
     assert SkillsMiddleware(backend=backend, sources=[])
+
+
+def test_current_deepagents_graph_invocation_uses_session_backend() -> None:
+    client = SessionStubClient()
+    backend = make_backend(client)
+    graph = create_deep_agent(
+        model=ToolCallingFakeModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "write_file",
+                            "args": {"file_path": "/deepagents.txt", "content": "ok"},
+                            "id": "write-1",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="done"),
+            ]
+        ),
+        backend=backend,
+    )
+    result_state = graph.invoke(
+        {"messages": [("user", "write the file")]},
+        config={"configurable": {"thread_id": "deepagents-current"}},
+    )
+
+    assert result_state["messages"][-1].content == "done"
+    claim = backend.get_session_claim_name("deepagents-current")
+    assert client.sandboxes[claim].files.write_calls == [
+        ("deepagents.txt", b"ok"),
+    ]

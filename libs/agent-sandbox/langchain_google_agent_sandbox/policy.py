@@ -32,8 +32,6 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 
-from langchain_google_agent_sandbox.backend import AgentSandboxBackend
-
 logger = logging.getLogger(__name__)
 
 
@@ -48,7 +46,7 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
 
     def __init__(
         self,
-        backend: AgentSandboxBackend,
+        backend: SandboxBackendProtocol,
         deny_prefixes: list[str] | None = None,
         deny_commands: list[str] | None = None,
         audit_log: Callable[[str, str, dict[str, Any]], None] | None = None,
@@ -56,15 +54,7 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
         strict_audit: bool = False,
     ) -> None:
         self._backend = backend
-        self._deny_prefixes_write = [
-            self._normalize_prefix(self._resolve_prefix(prefix, for_write=True))
-            for prefix in (deny_prefixes or [])
-        ]
-        self._deny_prefixes_edit = [
-            self._normalize_prefix(self._resolve_prefix(prefix, for_write=False))
-            for prefix in (deny_prefixes or [])
-        ]
-        self._deny_prefixes_canonical = [
+        self._deny_prefixes = [
             self._normalize_prefix(self._canonicalize_path(prefix))
             for prefix in (deny_prefixes or [])
         ]
@@ -73,11 +63,15 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
         self._strict_audit = strict_audit
 
     def __enter__(self) -> SandboxPolicyWrapper:
-        self._backend.__enter__()
+        enter = getattr(self._backend, "__enter__", None)
+        if callable(enter):
+            enter()
         return self
 
     def __exit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> None:
-        self._backend.__exit__(exc_type, exc, tb)
+        exit_backend = getattr(self._backend, "__exit__", None)
+        if callable(exit_backend):
+            exit_backend(exc_type, exc, tb)
 
     async def __aenter__(self) -> SandboxPolicyWrapper:
         return self.__enter__()
@@ -89,49 +83,17 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
 
     @staticmethod
     def _canonicalize_path(path: str) -> str:
-        normalized = posixpath.normpath(path.strip() or "/")
-        return "/" + normalized.lstrip("/")
+        rooted = "/" + (path.strip() or "/").lstrip("/")
+        return posixpath.normpath(rooted)
 
     @staticmethod
     def _normalize_prefix(path: str) -> str:
         canonical = SandboxPolicyWrapper._canonicalize_path(path)
         return canonical.rstrip("/") + "/" if canonical != "/" else "/"
 
-    def _resolve_prefix(self, path: str, *, for_write: bool) -> str:
-        stripped = path.strip() or "/"
-        if stripped == "/":
-            return "/"
-        try:
-            if for_write:
-                return self._backend._resolve_write_path(stripped)
-            return self._backend._to_internal(stripped)
-        except ValueError:
-            return self._canonicalize_path(stripped)
-
-    def _resolve_candidate_path(self, path: str, *, for_write: bool) -> str:
-        try:
-            if for_write:
-                return self._backend._resolve_write_path(path)
-            return self._backend._to_internal(path)
-        except ValueError:
-            return self._canonicalize_path(path)
-
-    def _is_denied_path(self, path: str, *, for_write: bool) -> bool:
-        normalized = self._normalize_prefix(
-            self._resolve_candidate_path(path, for_write=for_write)
-        )
-        deny_prefixes = (
-            self._deny_prefixes_write if for_write else self._deny_prefixes_edit
-        )
-        if any(normalized.startswith(prefix) for prefix in deny_prefixes):
-            return True
-        parts = [part for part in path.split("/") if part]
-        if ".." not in parts:
-            return False
-        canonical = self._normalize_prefix(self._canonicalize_path(path))
-        return any(
-            canonical.startswith(prefix) for prefix in self._deny_prefixes_canonical
-        )
+    def _is_denied_path(self, path: str) -> bool:
+        normalized = self._normalize_prefix(self._canonicalize_path(path))
+        return any(normalized.startswith(prefix) for prefix in self._deny_prefixes)
 
     def _emit_audit(
         self, operation: str, target: str, metadata: dict[str, Any]
@@ -175,10 +137,10 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
         return self._backend.glob(pattern, path)
 
     def download_files(self, paths: Iterable[str]) -> list[FileDownloadResponse]:
-        return self._backend.download_files(paths)
+        return self._backend.download_files(list(paths))
 
     def write(self, file_path: str, content: str) -> WriteResult:
-        if self._is_denied_path(file_path, for_write=True):
+        if self._is_denied_path(file_path):
             return WriteResult(
                 error=f"Policy denied: writes not allowed under '{file_path}'",
                 path=file_path,
@@ -195,7 +157,7 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
         new_string: str,
         replace_all: bool = False,
     ) -> EditResult:
-        if self._is_denied_path(file_path, for_write=False):
+        if self._is_denied_path(file_path):
             return EditResult(
                 error=f"Policy denied: edits not allowed under '{file_path}'",
                 path=file_path,
@@ -208,7 +170,7 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
 
     def delete(self, file_path: str) -> WriteResult:
         """Delete a file when path policy and audit permit it."""
-        if self._is_denied_path(file_path, for_write=True):
+        if self._is_denied_path(file_path):
             return WriteResult(
                 error=f"Policy denied: deletes not allowed under '{file_path}'",
                 path=file_path,
@@ -216,7 +178,13 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
         deny = self._emit_audit("delete", file_path, {})
         if deny is not None:
             return WriteResult(error=deny, path=file_path)
-        return self._backend.delete(file_path)
+        delete_backend = getattr(self._backend, "delete", None)
+        if not callable(delete_backend):
+            return WriteResult(
+                error="Policy backend does not support file deletion",
+                path=file_path,
+            )
+        return cast("WriteResult", delete_backend(file_path))
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         if self._is_denied_command(command):
@@ -238,7 +206,7 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
         allowed: list[tuple[int, str, bytes]] = []
 
         for index, (path, payload) in enumerate(pairs):
-            if self._is_denied_path(path, for_write=True):
+            if self._is_denied_path(path):
                 responses[index] = FileUploadResponse(
                     path=path, error=cast("Any", "policy_denied")
                 )
