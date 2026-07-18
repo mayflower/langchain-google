@@ -923,7 +923,22 @@ class AgentSandboxBackend(SandboxBackendProtocol):
     def _to_internal(self, path: str) -> str:
         stripped = path.strip() or "/"
         reject_control_chars(stripped)
-        normalized = stripped
+        normalized = posixpath.normpath(stripped)
+        if (
+            self._allow_absolute_paths
+            and normalized.startswith("/")
+            and normalized != "/"
+        ):
+            if normalized == self._runtime_root or normalized.startswith(
+                self._runtime_root + "/"
+            ):
+                internal_path = normalized
+            else:
+                internal_path = posixpath.normpath(
+                    posixpath.join(self._runtime_root, normalized.lstrip("/"))
+                )
+            self._to_runtime_relative(internal_path)
+            return internal_path
         if normalized == self._root_dir or normalized.startswith(self._root_dir + "/"):
             normalized = normalized[len(self._root_dir) :]
         normalized = normalized.lstrip("/")
@@ -946,6 +961,9 @@ class AgentSandboxBackend(SandboxBackendProtocol):
 
     def _to_public(self, internal_path: str) -> str:
         rel = posixpath.relpath(internal_path, self._root_dir)
+        if self._allow_absolute_paths and (rel == ".." or rel.startswith("../")):
+            self._to_runtime_relative(internal_path)
+            return internal_path
         return "/" if rel == "." else "/" + rel
 
     def _normalize_public_dir(self, path: str) -> str:

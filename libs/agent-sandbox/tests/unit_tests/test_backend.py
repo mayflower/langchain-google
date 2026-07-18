@@ -361,6 +361,28 @@ def test_path_virtualization_and_absolute_write_mode() -> None:
     assert any("base64 -d" in call for call, _ in sandbox.commands.calls)
 
 
+def test_absolute_paths_share_the_runtime_namespace() -> None:
+    files = StubFiles(entries=[FileEntry("item.txt")])
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(files=files),
+        root_dir="/app/workspace",
+        runtime_root="/app",
+        allow_absolute_paths=True,
+    )
+
+    assert backend._to_internal("/") == "/app/workspace"
+    assert backend._to_internal("/workspace") == "/app/workspace"
+    assert backend._to_internal("/uploads/file.txt") == "/app/uploads/file.txt"
+    assert backend._to_internal("/app/.agents/state.json") == "/app/.agents/state.json"
+    assert backend._to_public("/app/.agents/state.json") == "/app/.agents/state.json"
+
+    response = backend.ls("/workspace")
+
+    assert response.error is None
+    assert files.list_calls == ["workspace"]
+    assert response.entries[0]["path"] == "/workspace/item.txt"
+
+
 def test_grep_glob_and_malformed_output() -> None:
     grep_stdout = "/workspace/a b.py\x001:hit\nmalformed\n/workspace/no:bad\n"
     backend = AgentSandboxBackend.from_existing(
