@@ -3,7 +3,10 @@ from __future__ import annotations
 from importlib import metadata
 
 from langchain_google_agent_sandbox.backend import AgentSandboxBackend
-from langchain_google_agent_sandbox.factory import create_sandbox_backend_factory
+from langchain_google_agent_sandbox.factory import (
+    create_sandbox_backend,
+    create_sandbox_backend_factory,
+)
 from langchain_google_agent_sandbox.policy import SandboxPolicyWrapper
 from langchain_google_agent_sandbox.session_backend import (
     SessionAgentSandboxBackend,
@@ -22,6 +25,7 @@ __all__ = [
     "SessionAgentSandboxBackend",
     "SessionSandboxEndpoint",
     "__version__",
+    "create_sandbox_backend",
     "create_sandbox_backend_factory",
     "default_session_resolver",
 ]

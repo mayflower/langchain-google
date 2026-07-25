@@ -17,7 +17,6 @@ from __future__ import annotations
 import base64
 import logging
 import posixpath
-import re
 import shlex
 import threading
 import warnings
@@ -25,10 +24,12 @@ import weakref
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from types import SimpleNamespace
 from typing import Any, cast
 
 from deepagents.backends.protocol import (
+    DeleteResult,
     EditResult,
     ExecuteResponse,
     FileData,
@@ -43,12 +44,20 @@ from deepagents.backends.protocol import (
     SandboxBackendProtocol,
     WriteResult,
 )
+from deepagents.backends.utils import (
+    _get_backend_read_file_type,
+    check_empty_content,
+)
 from k8s_agent_sandbox.exceptions import SandboxNotFoundError
 
 from langchain_google_agent_sandbox import _compat
 from langchain_google_agent_sandbox._compat import SESSION_LABEL_KEY
 from langchain_google_agent_sandbox._errors import is_timeout_exception
-from langchain_google_agent_sandbox._paths import compile_glob, reject_control_chars
+from langchain_google_agent_sandbox._paths import (
+    compile_glob,
+    compile_grep_include_glob,
+    reject_control_chars,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +243,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
 
     def __enter__(self) -> AgentSandboxBackend:
         if not self._manage_lifecycle:
+            return self
+        if self._sandbox is not None:
             return self
         if self._sdk_client is None:
             msg = "Cannot manage lifecycle without an sdk_client"
@@ -463,6 +474,10 @@ class AgentSandboxBackend(SandboxBackendProtocol):
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         """Read raw UTF-8 content from a file, optionally by line window."""
+        if offset < 0:
+            return ReadResult(error=f"Line offset must be non-negative, got {offset}")
+        if limit <= 0:
+            return ReadResult(error=f"Line limit must be positive, got {limit}")
         self._assert_sandbox()
         with self._track_op():
             try:
@@ -472,24 +487,37 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 raise
             except Exception as error:
                 return ReadResult(error=f"Failed to read '{file_path}': {error}")
+        if _get_backend_read_file_type(file_path) != "text":
+            encoded = base64.b64encode(content).decode("ascii")
+            return ReadResult(file_data=FileData(content=encoded, encoding="base64"))
         try:
             decoded = content.decode("utf-8")
         except UnicodeDecodeError:
             encoded = base64.b64encode(content).decode("ascii")
             return ReadResult(file_data=FileData(content=encoded, encoding="base64"))
-        if not decoded:
-            return ReadResult(file_data=FileData(content="", encoding="utf-8"))
+        empty_message = check_empty_content(decoded)
+        if empty_message is not None:
+            return ReadResult(
+                file_data=FileData(content=empty_message, encoding="utf-8")
+            )
         lines = decoded.splitlines(keepends=True)
-        start = max(0, offset)
+        start = offset
         if start >= len(lines):
             return ReadResult(
                 error=f"Line offset {offset} exceeds file length ({len(lines)} lines)"
             )
-        selected = "".join(lines[start : min(len(lines), start + limit)])
-        return ReadResult(file_data=FileData(content=selected, encoding="utf-8"))
+        end = min(len(lines), start + limit)
+        selected = "".join(lines[start:end])
+        return ReadResult(
+            file_data=FileData(content=selected, encoding="utf-8"),
+            total_lines=len(lines),
+            start_line=start + 1,
+            end_line=end,
+            next_offset=end if end < len(lines) else None,
+        )
 
     def write(self, file_path: str, content: str) -> WriteResult:
-        """Create a new UTF-8 file, refusing to overwrite existing paths."""
+        """Create or overwrite a UTF-8 file."""
         self._assert_sandbox()
         with self._track_op():
             try:
@@ -500,11 +528,6 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                     path=file_path,
                 )
             try:
-                if self._path_exists_at(internal_path):
-                    return WriteResult(
-                        error=f"File '{file_path}' already exists",
-                        path=file_path,
-                    )
                 self._ensure_parent_dir(internal_path)
                 self._write_bytes_at(internal_path, content.encode("utf-8"))
             except SandboxNotFoundError:
@@ -580,52 +603,54 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             occurrences=occurrences if replace_all else 1,
         )
 
-    def delete(self, file_path: str) -> WriteResult:
-        """Delete one file without recursively deleting directories."""
+    def delete(self, file_path: str) -> DeleteResult:
+        """Delete a file, symlink, or directory tree."""
         self._assert_sandbox()
         with self._track_op():
             try:
                 internal_path = self._resolve_write_path(file_path)
             except ValueError as error:
-                return WriteResult(
+                return DeleteResult(
                     error=f"Error: Invalid path '{file_path}': {error}",
-                    path=file_path,
                 )
             state = self._file_state(internal_path)
             if state == "missing":
-                return WriteResult(
-                    error=f"File '{file_path}' does not exist",
-                    path=file_path,
+                return DeleteResult(
+                    error=f"Error: '{file_path}' not found",
                 )
-            if state == "dir":
-                return WriteResult(
-                    error=f"Path '{file_path}' is a directory",
-                    path=file_path,
-                )
-            if state != "file":
-                return WriteResult(
+            if state == "error":
+                return DeleteResult(
                     error=f"Cannot delete '{file_path}'",
-                    path=file_path,
                 )
             sandbox = self._assert_sandbox()
-            result = sandbox.commands.run(shlex.join(["rm", "-f", "--", internal_path]))
+            result = sandbox.commands.run(
+                shlex.join(["rm", "-rf", "--", internal_path])
+            )
             if result.exit_code != 0:
                 detail = result.stderr.strip() or f"exit code {result.exit_code}"
-                return WriteResult(
+                return DeleteResult(
                     error=f"Error deleting '{file_path}': {detail}",
-                    path=file_path,
                 )
-        return WriteResult(path=file_path)
+        return DeleteResult(path=file_path)
 
     def grep(
         self,
         pattern: str,
         path: str | None = None,
         glob: str | None = None,
+        *,
+        max_count: int | None = None,
     ) -> GrepResult:
         """Search literal text in files under ``path``."""
         sandbox = self._assert_sandbox()
         base_path = path or "/"
+        try:
+            include_matcher = compile_grep_include_glob(glob) if glob else None
+        except Exception as error:
+            return GrepResult(
+                matches=[],
+                error=f"invalid grep glob pattern {glob!r}: {error}",
+            )
         with self._track_op():
             try:
                 internal_path = self._to_internal(base_path)
@@ -634,8 +659,6 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                     matches=[], error=f"Invalid path '{base_path}': {error}"
                 )
             parts = ["grep", "-rHnFZ"]
-            if glob:
-                parts.append(f"--include={shlex.quote(glob)}")
             parts.extend(["-e", shlex.quote(pattern), shlex.quote(internal_path)])
             run_kwargs: dict[str, Any] = {}
             if self._default_timeout_seconds is not None:
@@ -679,18 +702,32 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 line_int = int(line_no)
             except ValueError:
                 continue
+            relative_path = (
+                posixpath.basename(raw_path)
+                if raw_path == internal_path
+                else posixpath.relpath(raw_path, internal_path)
+            )
+            if include_matcher is not None and not include_matcher(relative_path):
+                continue
             matches.append(
                 GrepMatch(path=self._to_public(raw_path), line=line_int, text=text)
             )
+        if max_count is not None and len(matches) > max_count:
+            return GrepResult(matches=matches[:max_count], truncated=True)
         return GrepResult(matches=matches)
 
-    def glob(self, pattern: str, path: str | None = "/") -> GlobResult:
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
         """Find files matching ``pattern`` under ``path``."""
         sandbox = self._assert_sandbox()
         base_path = path or "/"
+        if ".." in PurePosixPath(pattern).parts:
+            return GlobResult(
+                matches=[],
+                error="Path traversal is not allowed in glob patterns",
+            )
         try:
             matcher = compile_glob(pattern.lstrip("/"))
-        except re.error as error:
+        except Exception as error:
             return GlobResult(
                 matches=[],
                 error=f"invalid glob pattern {pattern!r}: {error}",
@@ -703,9 +740,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                     matches=[], error=f"Invalid path '{base_path}': {error}"
                 )
             command = (
-                f"find -L {shlex.quote(internal_path)} -mindepth 1"
-                f" \\( -type d -printf 'd\\t%s\\t%T@\\t%p\\0' \\)"
-                f" -o \\( -printf 'f\\t%s\\t%T@\\t%p\\0' \\)"
+                f"find -P {shlex.quote(internal_path)} -mindepth 1"
+                f" -type f -printf 'f\\t%s\\t%T@\\t%p\\0'"
             )
             run_kwargs: dict[str, Any] = {}
             if self._default_timeout_seconds is not None:
@@ -732,12 +768,12 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             if len(split) != 4:
                 continue
             type_char, size_str, mod_str, raw = split
-            if type_char not in {"d", "f"}:
+            if type_char != "f":
                 continue
             rel_path = posixpath.relpath(raw, internal_path)
             if not matcher(rel_path):
                 continue
-            info = FileInfo(path=self._to_public(raw), is_dir=type_char == "d")
+            info = FileInfo(path=self._to_public(raw), is_dir=False)
             try:
                 info["size"] = int(size_str)
             except ValueError:
@@ -1057,17 +1093,6 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             raise RuntimeError(msg)
         return base64.b64decode(result.stdout)
 
-    def _path_exists_at(self, internal_path: str) -> bool:
-        sandbox = self._assert_sandbox()
-        try:
-            runtime_rel = self._to_runtime_relative(internal_path)
-        except ValueError:
-            runtime_rel = None
-        if runtime_rel is not None:
-            return bool(sandbox.files.exists(runtime_rel))
-        command = f"sh -c {shlex.quote(f'test -e {shlex.quote(internal_path)}')}"
-        return sandbox.commands.run(command).exit_code == 0
-
     _FILE_STATE_VALID = frozenset({"missing", "dir", "file", "denied"})
     _DIR_STATE_VALID = frozenset({"missing", "writable", "denied", "not_dir"})
 
@@ -1088,7 +1113,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
 
     def _file_state(self, internal_path: str) -> str:
         check = (
-            f"if [ ! -e {shlex.quote(internal_path)} ]; then echo missing; exit 0; fi; "
+            f"if [ ! -e {shlex.quote(internal_path)} ] && "
+            f"[ ! -L {shlex.quote(internal_path)} ]; then echo missing; exit 0; fi; "
             f"if [ -d {shlex.quote(internal_path)} ]; then echo dir; exit 0; fi; "
             f"if [ -r {shlex.quote(internal_path)} ]; then echo file; else echo denied; fi"
         )

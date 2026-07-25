@@ -10,7 +10,8 @@ Looking for the JS/TS version? Check out [LangChain.js](https://github.com/langc
 `langchain-google-agent-sandbox` provides a DeepAgents backend for
 Kubernetes `k8s-agent-sandbox` runtimes. It lets LangChain agents run tools in
 Kubernetes-native sandboxes while keeping the package itself importable without
-a Kubernetes cluster.
+a Kubernetes cluster. The package implements the DeepAgents 0.7 backend
+protocols and requires DeepAgents 0.7.0b2 or newer.
 
 ## Quick Install
 
@@ -52,9 +53,14 @@ from langchain_google_agent_sandbox import (
     SandboxPolicyWrapper,
     SessionAgentSandboxBackend,
     SessionSandboxEndpoint,
+    create_sandbox_backend,
     create_sandbox_backend_factory,
 )
 ```
+
+`create_sandbox_backend_factory` is a deprecated compatibility name. In
+DeepAgents 0.7 it returns a concrete backend instance because callable backend
+factories are no longer supported.
 
 ## Existing Sandboxes
 
@@ -147,26 +153,30 @@ Endpoint-aware integrations can call `get_session_sandbox()`,
 prefer_pod_ip=False)`. An optional legacy-label fallback attaches only when
 exactly one migrated random-name Claim matches; ambiguity fails closed.
 
-## DeepAgents Factory
+## DeepAgents 0.7 Backend
 
 ```python
 from deepagents import create_deep_agent
 from k8s_agent_sandbox import SandboxClient
-from langchain_google_agent_sandbox import create_sandbox_backend_factory
+from langchain_google_agent_sandbox import create_sandbox_backend
 
-agent = create_deep_agent(
-    model=model,
-    backend=create_sandbox_backend_factory(
-        "python-deepagent-pool",
-        client=SandboxClient(),
-        root_dir="/workspace",
-    ),
-)
+with create_sandbox_backend(
+    "python-deepagent-pool",
+    client=SandboxClient(),
+    root_dir="/workspace",
+) as backend:
+    agent = create_deep_agent(
+        model=model,
+        backend=backend,
+    )
+    result = agent.invoke(
+        {"messages": [("user", "Create report.csv")]},
+    )
 ```
 
-The callable factory is retained for compatibility with request-scoped agents.
-It creates an ephemeral managed backend and deletes a newly created Claim when
-the backend is explicitly exited or finalized. Explicit exit detaches the
+The helper returns an initialized concrete backend, as required by DeepAgents
+0.7. It creates an ephemeral managed backend and deletes a newly created Claim
+when the backend is explicitly exited or finalized. Explicit exit detaches the
 fallback finalizer. It is not the durable session API.
 
 ## Policy Wrapper
@@ -229,10 +239,13 @@ Supported environment variables:
 
 ## Compatibility Notes
 
-This package uses public v1beta1 `k8s-agent-sandbox` APIs only. Claim creation,
-atomic get-or-create, readiness, validation, renewal, deletion, and endpoint
-metadata remain SDK responsibilities. The adapter never issues raw
-`CustomObjectsApi` calls and has no v1alpha1 fallback.
+This package targets the complete DeepAgents 0.7 backend protocol family:
+structured file operations, recursive deletion, paginated reads, bounded grep,
+glob matching, uploads/downloads, and sandbox execution. It uses public v1beta1
+`k8s-agent-sandbox` APIs only. Claim creation, atomic get-or-create, readiness,
+validation, renewal, deletion, and endpoint metadata remain SDK
+responsibilities. The adapter never issues raw `CustomObjectsApi` calls and has
+no v1alpha1 fallback.
 
 ## Troubleshooting
 

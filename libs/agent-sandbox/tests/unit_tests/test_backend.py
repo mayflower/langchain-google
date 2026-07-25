@@ -3,17 +3,24 @@ from __future__ import annotations
 import shlex
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from deepagents.backends.protocol import DeleteResult
+from deepagents.middleware.filesystem import FilesystemMiddleware
 from k8s_agent_sandbox.exceptions import SandboxNotFoundError
 
 from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
     SandboxPolicyWrapper,
     _compat,
+    create_sandbox_backend,
     create_sandbox_backend_factory,
 )
-from langchain_google_agent_sandbox._paths import compile_glob
+from langchain_google_agent_sandbox._paths import (
+    compile_glob,
+    compile_grep_include_glob,
+)
 
 
 class FileEntry:
@@ -156,6 +163,7 @@ def result(stdout: str = "", stderr: str = "", exit_code: int = 0) -> Any:
 def test_public_imports() -> None:
     assert AgentSandboxBackend
     assert SandboxPolicyWrapper
+    assert callable(create_sandbox_backend)
     assert callable(create_sandbox_backend_factory)
 
 
@@ -261,13 +269,25 @@ def test_read_window_binary_and_out_of_range() -> None:
     backend = AgentSandboxBackend.from_existing(
         StubSandbox(files=StubFiles(read=b"zero\none\ntwo"))
     )
-    assert backend.read("/x.txt", offset=1, limit=1).file_data["content"] == "one\n"
+    response = backend.read("/x.txt", offset=1, limit=1)
+    assert response.file_data["content"] == "one\n"
+    assert response.total_lines == 3
+    assert response.start_line == 2
+    assert response.end_line == 2
+    assert response.next_offset == 2
     assert "exceeds file length" in backend.read("/x.txt", offset=99).error
+    assert "non-negative" in backend.read("/x.txt", offset=-1).error
+    assert "positive" in backend.read("/x.txt", limit=0).error
 
     bad = AgentSandboxBackend.from_existing(StubSandbox(files=StubFiles(read=b"\xff")))
     file_data = bad.read("/bad.bin").file_data
     assert file_data["content"] == "/w=="
     assert file_data["encoding"] == "base64"
+
+    utf8_binary = AgentSandboxBackend.from_existing(
+        StubSandbox(files=StubFiles(read=b"valid utf-8"))
+    )
+    assert utf8_binary.read("/image.png").file_data["encoding"] == "base64"
 
 
 def test_read_preserves_line_endings_and_not_found_errors() -> None:
@@ -283,20 +303,23 @@ def test_read_preserves_line_endings_and_not_found_errors() -> None:
         missing.read("/x.txt")
 
 
-def test_write_refuses_existing_and_creates_parent() -> None:
+def test_write_overwrites_existing_and_creates_parent() -> None:
     files = StubFiles()
     files.exists_value = True
     backend = AgentSandboxBackend.from_existing(StubSandbox(files=files))
-    assert "already exists" in backend.write("/x.txt", "data").error
-
-    files = StubFiles()
-    commands = StubCommands([result(exit_code=0)])
-    backend = AgentSandboxBackend.from_existing(
-        StubSandbox(commands=commands, files=files)
-    )
-    response = backend.write("/dir/x.txt", "data")
+    response = backend.write("/x.txt", "data")
     assert response.error is None
-    assert files.write_calls == [("dir/x.txt", b"data")]
+    assert files.write_calls == [("x.txt", b"data")]
+    assert files.exists_calls == []
+
+    nested_files = StubFiles()
+    commands = StubCommands([result(exit_code=0)])
+    nested = AgentSandboxBackend.from_existing(
+        StubSandbox(commands=commands, files=nested_files)
+    )
+    nested_response = nested.write("/dir/x.txt", "data")
+    assert nested_response.error is None
+    assert nested_files.write_calls == [("dir/x.txt", b"data")]
     assert "mkdir -p /workspace/dir" in commands.calls[0][0]
 
 
@@ -314,15 +337,24 @@ def test_edit_occurrence_rules() -> None:
     assert files.write_calls == [("x", b"baz bar baz")]
 
 
-def test_delete_file_and_refuse_directory() -> None:
-    commands = StubCommands([result()])
+def test_delete_files_and_directories_recursively() -> None:
+    commands = StubCommands([result(), result()])
     backend = AgentSandboxBackend.from_existing(StubSandbox(commands=commands))
     backend._file_state = lambda path: "file"
-    assert backend.delete("/x.txt").error is None
-    assert "rm -f -- /workspace/x.txt" in commands.calls[0][0]
+    file_response = backend.delete("/x.txt")
+    assert isinstance(file_response, DeleteResult)
+    assert file_response.error is None
+    assert "rm -rf -- /workspace/x.txt" in commands.calls[0][0]
 
     backend._file_state = lambda path: "dir"
-    assert "directory" in backend.delete("/dir").error
+    directory_response = backend.delete("/dir")
+    assert directory_response.error is None
+    assert "rm -rf -- /workspace/dir" in commands.calls[1][0]
+
+    backend._file_state = lambda path: "missing"
+    missing = backend.delete("/missing")
+    assert missing.path is None
+    assert "not found" in missing.error
 
 
 def test_upload_and_download_partial_success() -> None:
@@ -350,7 +382,7 @@ def test_path_virtualization_and_absolute_write_mode() -> None:
     with pytest.raises(ValueError):
         backend._to_internal("/bad\x00path")
 
-    sandbox = StubSandbox(commands=StubCommands([result(exit_code=1), result()]))
+    sandbox = StubSandbox(commands=StubCommands([result(), result()]))
     backend = AgentSandboxBackend(
         sandbox,
         allow_absolute_paths=True,
@@ -402,8 +434,30 @@ def test_grep_glob_and_malformed_output() -> None:
         "/main.py",
         "/pkg/main.py",
     ]
-    assert backend.glob("file[z-a].py").error.startswith("invalid glob pattern")
     assert compile_glob("a/**/b")("ab") is False
+    assert compile_glob("{main,test}.py")("pkg/main.py")
+    assert compile_grep_include_glob("src/**/*.py")("src/pkg/main.py")
+    assert not compile_grep_include_glob("src/**/*.py")("other/main.py")
+    assert "traversal" in backend.glob("../*.py").error
+
+
+def test_grep_applies_include_glob_and_total_max_count() -> None:
+    stdout = (
+        "/workspace/src/a.py\x001:first\n"
+        "/workspace/src/b.txt\x002:ignored\n"
+        "/workspace/src/c.py\x003:second\n"
+    )
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(commands=StubCommands([result(stdout), result(stdout)]))
+    )
+
+    filtered = backend.grep("hit", glob="src/{a,c}.py", max_count=1)
+    assert filtered.matches == [{"path": "/src/a.py", "line": 1, "text": "first"}]
+    assert filtered.truncated is True
+
+    complete = backend.grep("hit", glob="src/a.py", max_count=1)
+    assert complete.matches == [{"path": "/src/a.py", "line": 1, "text": "first"}]
+    assert complete.truncated is False
 
 
 def test_lifecycle_create_delete_reattach_and_refusals() -> None:
@@ -553,18 +607,116 @@ def test_policy_read_operations_pass_through() -> None:
     assert wrapped.grep("hit").matches[0]["text"] == "hit"
 
 
-def test_factory_enters_backend_and_finalizer_is_idempotent() -> None:
+def test_policy_blocks_recursive_delete_over_denied_descendant() -> None:
+    commands = StubCommands([result()])
+    backend = AgentSandboxBackend.from_existing(StubSandbox(commands=commands))
+    wrapped = SandboxPolicyWrapper(backend, deny_prefixes=["/protected/data"])
+
+    response = wrapped.delete("/")
+
+    assert FilesystemMiddleware(backend=wrapped)
+    assert isinstance(response, DeleteResult)
+    assert response.error.startswith("Policy denied")
+    assert commands.calls == []
+
+
+@pytest.mark.asyncio
+async def test_policy_delegates_file_operations_and_context() -> None:
+    backend = MagicMock(spec=AgentSandboxBackend)
+    backend.id = "ns/claim"
+    backend.ls.return_value = SimpleNamespace(entries=[], error=None)
+    backend.glob.return_value = SimpleNamespace(matches=[], error=None)
+    backend.download_files.return_value = []
+    backend.edit.return_value = SimpleNamespace(
+        path="/file.txt", error=None, occurrences=1
+    )
+    backend.delete.return_value = DeleteResult(path="/file.txt")
+    backend.upload_files.return_value = [SimpleNamespace(path="/file.txt", error=None)]
+    wrapped = SandboxPolicyWrapper(backend)
+
+    with wrapped as entered:
+        assert entered is wrapped
+    async with wrapped as entered:
+        assert entered is wrapped
+    assert wrapped.ls("/").error is None
+    assert wrapped.glob("*.py").error is None
+    assert wrapped.download_files(iter(["/file.txt"])) == []
+    assert wrapped.edit("/file.txt", "old", "new").error is None
+    assert wrapped.delete("/file.txt").path == "/file.txt"
+    assert wrapped.upload_files({"/file.txt": b"data"})[0].error is None
+    assert wrapped.id == "ns/claim"
+    assert backend.__enter__.call_count == 2
+    assert backend.__exit__.call_count == 2
+
+
+def test_policy_denies_edit_and_partial_uploads() -> None:
+    backend = MagicMock(spec=AgentSandboxBackend)
+    backend.upload_files.return_value = [
+        SimpleNamespace(path="/allowed.txt", error=None)
+    ]
+    wrapped = SandboxPolicyWrapper(backend, deny_prefixes=["/blocked"])
+
+    edit = wrapped.edit("/blocked/file.txt", "old", "new")
+    uploads = wrapped.upload_files(
+        [
+            ("/blocked/file.txt", b"blocked"),
+            ("/allowed.txt", b"allowed"),
+        ]
+    )
+
+    assert edit.error.startswith("Policy denied")
+    assert uploads[0].error == "policy_denied"
+    assert uploads[1].error is None
+    backend.upload_files.assert_called_once_with([("/allowed.txt", b"allowed")])
+
+
+def test_policy_strict_audit_denies_all_mutations() -> None:
+    backend = MagicMock(spec=AgentSandboxBackend)
+
+    def fail_audit(operation: str, target: str, metadata: dict[str, Any]) -> None:
+        raise RuntimeError("audit unavailable")
+
+    wrapped = SandboxPolicyWrapper(
+        backend,
+        audit_log=fail_audit,
+        strict_audit=True,
+    )
+
+    assert "Audit log unavailable" in wrapped.write("/file.txt", "data").error
+    assert "Audit log unavailable" in wrapped.edit("/file.txt", "old", "new").error
+    assert "Audit log unavailable" in wrapped.delete("/file.txt").error
+    assert (
+        "Audit log unavailable"
+        in wrapped.upload_files([("/file.txt", b"data")])[0].error
+    )
+    backend.write.assert_not_called()
+    backend.edit.assert_not_called()
+    backend.delete.assert_not_called()
+    backend.upload_files.assert_not_called()
+
+
+def test_backend_helper_returns_deepagents_07_instance() -> None:
     client = StubClient()
-    factory = create_sandbox_backend_factory(
+    backend = create_sandbox_backend(
         "python",
         namespace="ns",
         client=client,
         session_id="thread-2",
     )
-    backend = factory(SimpleNamespace())
 
     assert isinstance(backend, AgentSandboxBackend)
+    assert FilesystemMiddleware(backend=backend)
     assert client.created
+    with backend as entered:
+        assert entered is backend
+        assert len(client.created) == 1
+    assert client.deleted == [("claim-1", "ns")]
+
+
+def test_backend_helper_finalizer_is_idempotent() -> None:
+    client = StubClient()
+    backend = create_sandbox_backend("python", namespace="ns", client=client)
+
     backend._finalizer()
     backend._finalizer()
     assert client.deleted == [("claim-1", "ns")]
@@ -572,9 +724,13 @@ def test_factory_enters_backend_and_finalizer_is_idempotent() -> None:
 
 def test_factory_finalizer_is_detached_after_explicit_exit() -> None:
     client = StubClient()
-    backend = create_sandbox_backend_factory("python", namespace="ns", client=client)(
-        SimpleNamespace()
-    )
+    with pytest.warns(DeprecationWarning, match="concrete backend"):
+        backend = create_sandbox_backend_factory(
+            "python", namespace="ns", client=client
+        )
+    assert FilesystemMiddleware(backend=backend)
+    with pytest.warns(DeprecationWarning, match="Calling the backend"):
+        assert backend(SimpleNamespace()) is backend
     finalizer = backend._finalizer
 
     backend.__exit__(None, None, None)
@@ -586,14 +742,13 @@ def test_factory_finalizer_is_detached_after_explicit_exit() -> None:
 
 def test_factory_preserves_reattached_backend() -> None:
     client = StubClient(claims=["claim-old"])
-    factory = create_sandbox_backend_factory(
-        "python",
-        namespace="ns",
-        client=client,
-        session_id="thread-2",
-    )
-
-    backend = factory(SimpleNamespace())
+    with pytest.warns(DeprecationWarning, match="concrete backend"):
+        backend = create_sandbox_backend_factory(
+            "python",
+            namespace="ns",
+            client=client,
+            session_id="thread-2",
+        )
 
     assert isinstance(backend, AgentSandboxBackend)
     assert backend.id == "ns/claim-old"

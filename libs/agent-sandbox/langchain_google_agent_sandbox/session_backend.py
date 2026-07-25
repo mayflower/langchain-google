@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from deepagents.backends.protocol import (
+    DeleteResult,
     EditResult,
     ExecuteResponse,
     FileDownloadResponse,
@@ -540,11 +541,11 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
     ) -> EditResult:
         return self._invoke("edit", file_path, old_string, new_string, replace_all)
 
-    def delete(self, file_path: str) -> WriteResult:
-        """Delete a file from the current session sandbox."""
+    def delete(self, file_path: str) -> DeleteResult:
+        """Recursively delete a path from the current session sandbox."""
         return self._invoke("delete", file_path)
 
-    async def adelete(self, file_path: str) -> WriteResult:
+    async def adelete(self, file_path: str) -> DeleteResult:
         """Async version of :meth:`delete`."""
         return await asyncio.to_thread(self.delete, file_path)
 
@@ -553,10 +554,12 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         pattern: str,
         path: str | None = None,
         glob: str | None = None,
+        *,
+        max_count: int | None = None,
     ) -> GrepResult:
-        return self._invoke("grep", pattern, path, glob)
+        return self._invoke("grep", pattern, path, glob, max_count=max_count)
 
-    def glob(self, pattern: str, path: str | None = "/") -> GlobResult:
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
         return self._invoke("glob", pattern, path)
 
     def upload_files(

@@ -407,7 +407,7 @@ async def test_sync_and_async_deepagents_delegation() -> None:
     backend.write("/x", "x")
     backend.edit("/x", "x", "y")
     backend.delete("/x")
-    backend.grep("x")
+    backend.grep("x", max_count=7)
     backend.glob("*")
     backend.upload_files([])
     backend.download_files([])
@@ -418,13 +418,15 @@ async def test_sync_and_async_deepagents_delegation() -> None:
     await backend.awrite("/x", "x")
     await backend.aedit("/x", "x", "y")
     await backend.adelete("/x")
-    await backend.agrep("x")
+    await backend.agrep("x", max_count=3)
     await backend.aglob("*")
     await backend.aupload_files([])
     await backend.adownload_files([])
 
     assert concrete.execute.call_count == 2
     assert concrete.download_files.call_count == 2
+    assert concrete.grep.call_args_list[0].kwargs == {"max_count": 7}
+    assert concrete.grep.call_args_list[1].kwargs == {"max_count": 3}
 
 
 def test_direct_composite_and_middleware_integration() -> None:

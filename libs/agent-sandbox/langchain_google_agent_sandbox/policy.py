@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterable
 from typing import Any, cast
 
 from deepagents.backends.protocol import (
+    DeleteResult,
     EditResult,
     ExecuteResponse,
     FileDownloadResponse,
@@ -129,11 +130,16 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
         return self._backend.read(file_path, offset, limit)
 
     def grep(
-        self, pattern: str, path: str | None = None, glob: str | None = None
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        *,
+        max_count: int | None = None,
     ) -> GrepResult:
-        return self._backend.grep(pattern, path, glob)
+        return self._backend.grep(pattern, path, glob, max_count=max_count)
 
-    def glob(self, pattern: str, path: str | None = "/") -> GlobResult:
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
         return self._backend.glob(pattern, path)
 
     def download_files(self, paths: Iterable[str]) -> list[FileDownloadResponse]:
@@ -168,23 +174,29 @@ class SandboxPolicyWrapper(SandboxBackendProtocol):
             return EditResult(error=deny, path=file_path, occurrences=0)
         return self._backend.edit(file_path, old_string, new_string, replace_all)
 
-    def delete(self, file_path: str) -> WriteResult:
-        """Delete a file when path policy and audit permit it."""
-        if self._is_denied_path(file_path):
-            return WriteResult(
-                error=f"Policy denied: deletes not allowed under '{file_path}'",
-                path=file_path,
+    def delete(self, file_path: str) -> DeleteResult:
+        """Recursively delete a path when policy and audit permit it."""
+        normalized = self._normalize_prefix(self._canonicalize_path(file_path))
+        intersects_denied = any(
+            normalized.startswith(prefix) or prefix.startswith(normalized)
+            for prefix in self._deny_prefixes
+        )
+        if intersects_denied:
+            return DeleteResult(
+                error=f"Policy denied: deletes not allowed for '{file_path}'",
             )
         deny = self._emit_audit("delete", file_path, {})
         if deny is not None:
-            return WriteResult(error=deny, path=file_path)
+            return DeleteResult(error=deny)
         delete_backend = getattr(self._backend, "delete", None)
         if not callable(delete_backend):
-            return WriteResult(
+            return DeleteResult(
                 error="Policy backend does not support file deletion",
-                path=file_path,
             )
-        return cast("WriteResult", delete_backend(file_path))
+        try:
+            return cast("DeleteResult", delete_backend(file_path))
+        except NotImplementedError:
+            return DeleteResult(error="Policy backend does not support file deletion")
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         if self._is_denied_command(command):
