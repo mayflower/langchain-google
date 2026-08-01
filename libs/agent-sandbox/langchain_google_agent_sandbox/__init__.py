@@ -10,6 +10,7 @@ from langchain_google_agent_sandbox.factory import (
 from langchain_google_agent_sandbox.policy import SandboxPolicyWrapper
 from langchain_google_agent_sandbox.session_backend import (
     SessionAgentSandboxBackend,
+    SessionLifecycleContext,
     SessionSandboxEndpoint,
     default_session_resolver,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "AgentSandboxBackend",
     "SandboxPolicyWrapper",
     "SessionAgentSandboxBackend",
+    "SessionLifecycleContext",
     "SessionSandboxEndpoint",
     "__version__",
     "create_sandbox_backend",

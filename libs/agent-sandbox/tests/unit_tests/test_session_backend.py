@@ -21,6 +21,7 @@ from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
     SandboxPolicyWrapper,
     SessionAgentSandboxBackend,
+    SessionLifecycleContext,
     SessionSandboxEndpoint,
     default_session_resolver,
 )
@@ -42,6 +43,7 @@ class SessionStubClient:
         self.labels: dict[str, dict[str, str]] = {}
         self.warm_pools: dict[str, str] = {}
         self.acquire_count = 0
+        self.list_count = 0
         self.deleted: list[tuple[str, str]] = []
         self.renewed: list[tuple[str, str, int]] = []
 
@@ -85,6 +87,7 @@ class SessionStubClient:
         self, namespace: str, label_selector: str | None = None
     ) -> list[str]:
         del namespace
+        self.list_count += 1
         if label_selector is None:
             return list(self.sandboxes)
         key, value = label_selector.split("=", 1)
@@ -337,6 +340,203 @@ def test_created_attached_delete_hooks_and_close_semantics() -> None:
     backend.get_session_claim_name("other")
     backend.close()
     assert client.deleted == [(claim, "default")]
+
+
+def test_lifecycle_callback_order_context_and_created_values() -> None:
+    client = SessionStubClient()
+    events: list[tuple[str, str, bool | None]] = []
+
+    def record_context(
+        name: str, context: SessionLifecycleContext, created: bool | None = None
+    ) -> None:
+        assert context.raw_session_id == "lifecycle"
+        assert context.namespace == "default"
+        assert context.warm_pool == "python"
+        assert context.claim_name == f"session-{context.opaque_session_id}"
+        events.append((name, context.opaque_session_id, created))
+
+    backend = make_backend(
+        client,
+        before_session_acquire=lambda context: record_context("before", context),
+        on_session_created=lambda opaque, value: events.append(
+            ("legacy-created", opaque, None)
+        ),
+        on_session_attached=lambda opaque, value: events.append(
+            ("legacy-attached", opaque, None)
+        ),
+        after_session_acquire=lambda context, value, created: record_context(
+            "after", context, created
+        ),
+        on_session_accessed=lambda context: record_context("accessed", context),
+        before_session_deleted=lambda opaque, value: events.append(
+            ("legacy-before-delete", opaque, None)
+        ),
+        after_session_deleted=lambda context: record_context("after-delete", context),
+    )
+
+    backend.get_session_claim_name("lifecycle")
+    opaque = backend.opaque_session_id("lifecycle")
+    assert events == [
+        ("before", opaque, None),
+        ("legacy-created", opaque, None),
+        ("after", opaque, True),
+        ("accessed", opaque, None),
+    ]
+
+    events.clear()
+    backend.get_session_claim_name("lifecycle")
+    assert events == [("accessed", opaque, None)]
+
+    events.clear()
+    backend.close_session("lifecycle")
+    backend.get_session_claim_name("lifecycle")
+    assert events == [
+        ("before", opaque, None),
+        ("legacy-attached", opaque, None),
+        ("after", opaque, False),
+        ("accessed", opaque, None),
+    ]
+
+    events.clear()
+    backend.delete_session("lifecycle")
+    assert events == [
+        ("legacy-before-delete", opaque, None),
+        ("after-delete", opaque, None),
+    ]
+
+
+def test_pre_acquire_denial_makes_no_sdk_calls() -> None:
+    client = SessionStubClient()
+    denied = RuntimeError("consumer denied")
+    errors: list[tuple[SessionLifecycleContext, Exception]] = []
+    backend = make_backend(
+        client,
+        legacy_label_fallback=True,
+        before_session_acquire=lambda context: (_ for _ in ()).throw(denied),
+        on_session_acquire_error=lambda context, error: errors.append((context, error)),
+    )
+
+    with pytest.raises(RuntimeError, match="consumer denied") as exc_info:
+        backend.get_session_claim_name("denied")
+
+    assert exc_info.value is denied
+    assert client.acquire_count == 0
+    assert client.list_count == 0
+    assert client.sandboxes == {}
+    assert client.deleted == []
+    assert client.renewed == []
+    assert len(errors) == 1
+    assert errors[0][0].raw_session_id == "denied"
+    assert errors[0][1] is denied
+
+
+def test_after_acquire_failure_cleanup_depends_on_claim_ownership() -> None:
+    new_client = SessionStubClient()
+
+    def fail_after(
+        context: SessionLifecycleContext,
+        backend: AgentSandboxBackend,
+        created: bool,
+    ) -> None:
+        del context, backend, created
+        raise RuntimeError("bookkeeping failed")
+
+    new_backend = make_backend(new_client, after_session_acquire=fail_after)
+    with pytest.raises(RuntimeError, match="bookkeeping failed"):
+        new_backend.get_session_claim_name("new")
+    assert len(new_client.deleted) == 1
+
+    existing_client = SessionStubClient()
+    should_fail = False
+
+    def fail_attached(
+        context: SessionLifecycleContext,
+        backend: AgentSandboxBackend,
+        created: bool,
+    ) -> None:
+        del context, backend
+        if should_fail and not created:
+            raise RuntimeError("attach bookkeeping failed")
+
+    existing_backend = make_backend(
+        existing_client, after_session_acquire=fail_attached
+    )
+    claim = existing_backend.get_session_claim_name("existing")
+    existing_backend.close_session("existing")
+    should_fail = True
+
+    with pytest.raises(RuntimeError, match="attach bookkeeping failed"):
+        existing_backend.get_session_claim_name("existing")
+
+    assert existing_client.deleted == []
+    assert claim in existing_client.sandboxes
+    assert existing_client.sandboxes[claim].closed
+
+
+def test_error_callbacks_do_not_mask_acquire_or_delete_errors() -> None:
+    acquire_client = SessionStubClient()
+    acquire_error = ValueError("SDK acquire failed")
+    acquire_client.get_or_create_sandbox = MagicMock(side_effect=acquire_error)
+
+    def fail_error_observer(context: SessionLifecycleContext, error: Exception) -> None:
+        del context, error
+        raise RuntimeError("observer failed")
+
+    acquire_backend = make_backend(
+        acquire_client,
+        on_session_acquire_error=fail_error_observer,
+    )
+    with pytest.raises(ValueError, match="SDK acquire failed") as acquire_info:
+        acquire_backend.get_session_claim_name("broken-acquire")
+    assert acquire_info.value is acquire_error
+
+    delete_client = SessionStubClient()
+    delete_backend = make_backend(
+        delete_client,
+        on_session_delete_error=fail_error_observer,
+    )
+    delete_backend.get_session_claim_name("broken-delete")
+    delete_error = ValueError("SDK delete failed")
+    delete_client.delete_sandbox = MagicMock(side_effect=delete_error)
+    with pytest.raises(ValueError, match="SDK delete failed") as delete_info:
+        delete_backend.delete_session("broken-delete")
+    assert delete_info.value is delete_error
+
+
+def test_context_resolution_is_once_per_operation_and_concurrency_safe() -> None:
+    resolved = 0
+
+    def resolver(config: dict[str, Any]) -> str:
+        nonlocal resolved
+        resolved += 1
+        return config["configurable"]["thread_id"]
+
+    contexts: list[SessionLifecycleContext] = []
+    backend = make_backend(
+        session_resolver=resolver,
+        before_session_acquire=contexts.append,
+    )
+    backend._active_config = lambda: {"configurable": {"thread_id": "active"}}
+
+    backend.get_session_claim_name()
+    assert resolved == 1
+    backend.get_session_claim_name()
+    assert resolved == 2
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(
+            executor.map(
+                backend.get_session_claim_name,
+                [f"session-{index}" for index in range(16)],
+            )
+        )
+
+    observed = {context.raw_session_id for context in contexts}
+    assert observed == {"active", *(f"session-{index}" for index in range(16))}
+    assert all(
+        context.claim_name == f"session-{context.opaque_session_id}"
+        for context in contexts
+    )
 
 
 def test_created_hook_failure_deletes_new_claim() -> None:

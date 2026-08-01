@@ -52,6 +52,7 @@ from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
     SandboxPolicyWrapper,
     SessionAgentSandboxBackend,
+    SessionLifecycleContext,
     SessionSandboxEndpoint,
     create_sandbox_backend,
     create_sandbox_backend_factory,
@@ -147,6 +148,35 @@ Lifecycle hooks receive only the opaque session ID and the concrete backend:
 - `on_session_created`: initialize a genuinely new Claim;
 - `on_session_attached`: observe reattachment without restoring again;
 - `before_session_deleted`: flush state before explicit deletion.
+
+Consumers that need external admission or durable lifecycle bookkeeping can
+use the generic hooks and their immutable `SessionLifecycleContext`:
+
+```python
+def admit(context: SessionLifecycleContext) -> None:
+    if capacity_is_full(context.raw_session_id):
+        raise CapacityUnavailableError("sandbox capacity is full")
+
+
+backend = SessionAgentSandboxBackend(
+    SandboxClient(cleanup=False),
+    warm_pool="python-deepagent-pool",
+    session_secret=os.environ["SANDBOX_SESSION_SECRET"],
+    before_session_acquire=admit,
+    after_session_acquire=lambda context, backend, created: record_claim(
+        context.claim_name, created=created
+    ),
+    on_session_accessed=lambda context: record_access(context.opaque_session_id),
+    after_session_deleted=lambda context: record_deletion(context.claim_name),
+)
+```
+
+Lifecycle callbacks are synchronous. `before_session_acquire` may reject an
+acquisition before any Kubernetes request is made. Error callbacks are
+best-effort observers and never replace the original acquisition or deletion
+exception. Keep `on_session_accessed` cheap and throttle durable writes in the
+consumer. The legacy `on_session_created`, `on_session_attached`, and
+`before_session_deleted` hooks retain their existing signatures and behavior.
 
 Endpoint-aware integrations can call `get_session_sandbox()`,
 `get_session_claim_name()`, and `get_session_endpoint(port,

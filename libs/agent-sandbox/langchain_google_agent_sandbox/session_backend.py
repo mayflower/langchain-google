@@ -22,6 +22,7 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import logging
 import threading
 import time
 import weakref
@@ -51,6 +52,29 @@ from langchain_google_agent_sandbox.backend import AgentSandboxBackend
 SessionResolver = Callable[[Mapping[str, Any]], str]
 SessionHook = Callable[[str, AgentSandboxBackend], None]
 BeforeDeleteHook = Callable[[str, AgentSandboxBackend | None], None]
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SessionLifecycleContext:
+    """Immutable identity and routing data for one session operation."""
+
+    raw_session_id: str
+    opaque_session_id: str
+    claim_name: str
+    namespace: str
+    warm_pool: str
+
+
+BeforeSessionAcquireHook = Callable[[SessionLifecycleContext], None]
+AfterSessionAcquireHook = Callable[
+    [SessionLifecycleContext, AgentSandboxBackend, bool], None
+]
+SessionAcquireErrorHook = Callable[[SessionLifecycleContext, Exception], None]
+SessionAccessedHook = Callable[[SessionLifecycleContext], None]
+AfterSessionDeletedHook = Callable[[SessionLifecycleContext], None]
+SessionDeleteErrorHook = Callable[[SessionLifecycleContext, Exception], None]
 
 
 @dataclass(frozen=True)
@@ -130,6 +154,12 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         on_session_created: SessionHook | None = None,
         on_session_attached: SessionHook | None = None,
         before_session_deleted: BeforeDeleteHook | None = None,
+        before_session_acquire: BeforeSessionAcquireHook | None = None,
+        after_session_acquire: AfterSessionAcquireHook | None = None,
+        on_session_acquire_error: SessionAcquireErrorHook | None = None,
+        on_session_accessed: SessionAccessedHook | None = None,
+        after_session_deleted: AfterSessionDeletedHook | None = None,
+        on_session_delete_error: SessionDeleteErrorHook | None = None,
     ) -> None:
         if not warm_pool:
             msg = "warm_pool cannot be empty"
@@ -192,6 +222,12 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         self._on_session_created = on_session_created
         self._on_session_attached = on_session_attached
         self._before_session_deleted = before_session_deleted
+        self._before_session_acquire = before_session_acquire
+        self._after_session_acquire = after_session_acquire
+        self._on_session_acquire_error = on_session_acquire_error
+        self._on_session_accessed = on_session_accessed
+        self._after_session_deleted = after_session_deleted
+        self._on_session_delete_error = on_session_delete_error
         self._entries: dict[str, _SessionEntry] = {}
         self._session_locks: weakref.WeakValueDictionary[str, threading.RLock] = (
             weakref.WeakValueDictionary()
@@ -212,6 +248,12 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
 
     def opaque_session_id(self, session_id: str | None = None) -> str:
         """Return the stable opaque identifier for an explicit or active session."""
+        return self._resolve_context(session_id).opaque_session_id
+
+    def _resolve_context(
+        self, session_id: str | None = None
+    ) -> SessionLifecycleContext:
+        """Resolve all immutable session data exactly once for an operation."""
         raw_identity = session_id
         if raw_identity is None:
             raw_identity = self._session_resolver(self._active_config())
@@ -223,7 +265,14 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
             raw_identity.encode("utf-8"),
             hashlib.sha256,
         ).digest()
-        return base64.b32encode(digest).decode("ascii").rstrip("=").lower()
+        opaque_session_id = base64.b32encode(digest).decode("ascii").rstrip("=").lower()
+        return SessionLifecycleContext(
+            raw_session_id=raw_identity,
+            opaque_session_id=opaque_session_id,
+            claim_name=self._claim_name(opaque_session_id),
+            namespace=self._namespace,
+            warm_pool=self._warm_pool,
+        )
 
     @staticmethod
     def _claim_name(opaque_session_id: str) -> str:
@@ -271,56 +320,93 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
             default_timeout_seconds=self._default_timeout_seconds,
         )
 
-    def _acquire(self, opaque_session_id: str) -> _SessionEntry:
-        claim_name = self._claim_name(opaque_session_id)
-        legacy_claim = self._legacy_claim(opaque_session_id, claim_name)
-        if legacy_claim is not None:
-            sandbox = _compat.get_sandbox(
-                self._client,
-                claim_name=legacy_claim,
-                namespace=self._namespace,
-                warm_pool=self._warm_pool,
-            )
-            created = False
-            claim_name = legacy_claim
-        else:
-            labels = dict(self._labels)
-            acquisition = self._client.get_or_create_sandbox(
-                warmpool=self._warm_pool,
-                namespace=self._namespace,
-                sandbox_ready_timeout=self._sandbox_ready_timeout,
-                labels=labels or None,
-                claim_name=claim_name,
-                required_labels={self.SESSION_LABEL_KEY: opaque_session_id},
-                shutdown_after_seconds=self._idle_ttl_seconds,
-            )
-            sandbox = acquisition.sandbox
-            created = acquisition.created
-
-        backend = self._wrap(sandbox)
-        entry = _SessionEntry(
-            backend=backend,
-            sandbox=sandbox,
-            claim_name=claim_name,
-            last_accessed_at=time.monotonic(),
-        )
+    @staticmethod
+    def _notify_error(
+        callback: SessionAcquireErrorHook | SessionDeleteErrorHook | None,
+        context: SessionLifecycleContext,
+        error: Exception,
+        *,
+        operation: str,
+    ) -> None:
+        if callback is None:
+            return
         try:
+            callback(context, error)
+        except Exception:
+            logger.exception(
+                "Session %s error callback failed for opaque session %s",
+                operation,
+                context.opaque_session_id,
+            )
+
+    def _acquire(self, context: SessionLifecycleContext) -> _SessionEntry:
+        created = False
+        backend: AgentSandboxBackend | None = None
+        claim_name = context.claim_name
+        try:
+            if self._before_session_acquire is not None:
+                self._before_session_acquire(context)
+            legacy_claim = self._legacy_claim(context.opaque_session_id, claim_name)
+            if legacy_claim is not None:
+                sandbox = _compat.get_sandbox(
+                    self._client,
+                    claim_name=legacy_claim,
+                    namespace=context.namespace,
+                    warm_pool=context.warm_pool,
+                )
+                claim_name = legacy_claim
+            else:
+                labels = dict(self._labels)
+                acquisition = self._client.get_or_create_sandbox(
+                    warmpool=context.warm_pool,
+                    namespace=context.namespace,
+                    sandbox_ready_timeout=self._sandbox_ready_timeout,
+                    labels=labels or None,
+                    claim_name=claim_name,
+                    required_labels={self.SESSION_LABEL_KEY: context.opaque_session_id},
+                    shutdown_after_seconds=self._idle_ttl_seconds,
+                )
+                sandbox = acquisition.sandbox
+                created = acquisition.created
+
+            backend = self._wrap(sandbox)
+            entry = _SessionEntry(
+                backend=backend,
+                sandbox=sandbox,
+                claim_name=claim_name,
+                last_accessed_at=time.monotonic(),
+            )
             self._renew(entry, force=True)
             if created:
                 if self._on_session_created is not None:
-                    self._on_session_created(opaque_session_id, backend)
+                    self._on_session_created(context.opaque_session_id, backend)
             elif self._on_session_attached is not None:
-                self._on_session_attached(opaque_session_id, backend)
-        except Exception:
+                self._on_session_attached(context.opaque_session_id, backend)
+            if self._after_session_acquire is not None:
+                self._after_session_acquire(context, backend, created)
+            return entry
+        except Exception as error:
             if created:
-                _compat.delete_sandbox(
-                    self._client,
-                    claim_name=claim_name,
-                    namespace=self._namespace,
-                )
-            backend.close()
+                try:
+                    _compat.delete_sandbox(
+                        self._client,
+                        claim_name=claim_name,
+                        namespace=context.namespace,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to clean up newly created Claim %s",
+                        claim_name,
+                    )
+            if backend is not None:
+                backend.close()
+            self._notify_error(
+                self._on_session_acquire_error,
+                context,
+                error,
+                operation="acquire",
+            )
             raise
-        return entry
 
     def _renew(self, entry: _SessionEntry, *, force: bool = False) -> None:
         if self._idle_ttl_seconds is None:
@@ -390,33 +476,37 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
                     self._entries.pop(opaque_session_id, None)
                 entry.backend.close()
 
-    def _entry_locked(self, opaque_session_id: str) -> _SessionEntry:
+    def _entry_locked(self, context: SessionLifecycleContext) -> _SessionEntry:
         if self._closed:
             msg = "SessionAgentSandboxBackend is closed"
             raise RuntimeError(msg)
         with self._cache_lock:
-            entry = self._entries.get(opaque_session_id)
+            entry = self._entries.get(context.opaque_session_id)
         if entry is not None:
             try:
                 self._renew(entry)
                 entry.last_accessed_at = time.monotonic()
+                if self._on_session_accessed is not None:
+                    self._on_session_accessed(context)
                 return entry
             except SandboxNotFoundError:
                 entry.backend.close()
                 with self._cache_lock:
-                    self._entries.pop(opaque_session_id, None)
-        entry = self._acquire(opaque_session_id)
+                    self._entries.pop(context.opaque_session_id, None)
+        entry = self._acquire(context)
         entry.last_accessed_at = time.monotonic()
         with self._cache_lock:
-            self._entries[opaque_session_id] = entry
+            self._entries[context.opaque_session_id] = entry
+        if self._on_session_accessed is not None:
+            self._on_session_accessed(context)
         return entry
 
     def _entry(self, session_id: str | None = None) -> tuple[str, _SessionEntry]:
-        opaque_session_id = self.opaque_session_id(session_id)
-        self._evict_idle_entries(exclude=opaque_session_id)
-        with self._lock_for(opaque_session_id):
-            entry = self._entry_locked(opaque_session_id)
-            return opaque_session_id, entry
+        context = self._resolve_context(session_id)
+        self._evict_idle_entries(exclude=context.opaque_session_id)
+        with self._lock_for(context.opaque_session_id):
+            entry = self._entry_locked(context)
+            return context.opaque_session_id, entry
 
     def _invoke(
         self,
@@ -424,15 +514,15 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        opaque_session_id = self.opaque_session_id()
-        self._evict_idle_entries(exclude=opaque_session_id)
-        with self._lock_for(opaque_session_id):
-            entry = self._entry_locked(opaque_session_id)
+        context = self._resolve_context()
+        self._evict_idle_entries(exclude=context.opaque_session_id)
+        with self._lock_for(context.opaque_session_id):
+            entry = self._entry_locked(context)
             try:
                 return getattr(entry.backend, method_name)(*args, **kwargs)
             except SandboxNotFoundError:
-                self._invalidate(opaque_session_id)
-                replacement = self._entry_locked(opaque_session_id)
+                self._invalidate(context.opaque_session_id)
+                replacement = self._entry_locked(context)
                 return getattr(replacement.backend, method_name)(*args, **kwargs)
 
     def _invalidate(self, opaque_session_id: str) -> None:
@@ -443,34 +533,45 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
 
     def close_session(self, session_id: str) -> None:
         """Close local connectors for one session without deleting its Claim."""
-        opaque_session_id = self.opaque_session_id(session_id)
-        with self._lock_for(opaque_session_id):
-            self._invalidate(opaque_session_id)
+        context = self._resolve_context(session_id)
+        with self._lock_for(context.opaque_session_id):
+            self._invalidate(context.opaque_session_id)
 
     def delete_session(self, session_id: str) -> None:
         """Run the delete hook and explicitly delete one session Claim."""
-        opaque_session_id = self.opaque_session_id(session_id)
-        claim_name = self._claim_name(opaque_session_id)
-        with self._lock_for(opaque_session_id):
-            with self._cache_lock:
-                entry = self._entries.get(opaque_session_id)
-            if self._before_session_deleted is not None:
-                self._before_session_deleted(
-                    opaque_session_id,
-                    entry.backend if entry is not None else None,
+        context = self._resolve_context(session_id)
+        claim_name = context.claim_name
+        with self._lock_for(context.opaque_session_id):
+            try:
+                with self._cache_lock:
+                    entry = self._entries.get(context.opaque_session_id)
+                if self._before_session_deleted is not None:
+                    self._before_session_deleted(
+                        context.opaque_session_id,
+                        entry.backend if entry is not None else None,
+                    )
+                if entry is not None:
+                    claim_name = entry.claim_name
+                else:
+                    legacy = self._legacy_claim(context.opaque_session_id, claim_name)
+                    if legacy is not None:
+                        claim_name = legacy
+                _compat.delete_sandbox(
+                    self._client,
+                    claim_name=claim_name,
+                    namespace=context.namespace,
                 )
-            if entry is not None:
-                claim_name = entry.claim_name
-            else:
-                legacy = self._legacy_claim(opaque_session_id, claim_name)
-                if legacy is not None:
-                    claim_name = legacy
-            _compat.delete_sandbox(
-                self._client,
-                claim_name=claim_name,
-                namespace=self._namespace,
-            )
-            self._invalidate(opaque_session_id)
+                self._invalidate(context.opaque_session_id)
+                if self._after_session_deleted is not None:
+                    self._after_session_deleted(context)
+            except Exception as error:
+                self._notify_error(
+                    self._on_session_delete_error,
+                    context,
+                    error,
+                    operation="delete",
+                )
+                raise
 
     def close(self) -> None:
         """Close every local connector without deleting Kubernetes Claims."""
