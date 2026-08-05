@@ -56,24 +56,40 @@ python main.py \
 
 ## Durable Sessions
 
-Use one long-lived backend instance and pass the LangGraph thread ID in each
-run config. The secret must remain stable across replicas and restarts.
+Durable session lifecycle belongs to your product, not to this package. Supply
+it through a `SandboxSessionProvider`: the adapter caches the lease you return
+and never creates, renews, or deletes a Claim itself.
 
 ```python
-from langchain_google_agent_sandbox import SessionAgentSandboxBackend
-
-backend = SessionAgentSandboxBackend(
-    client,
-    "python-deepagent-pool",
-    session_secret=os.environ["SANDBOX_SESSION_SECRET"],
-    idle_ttl_seconds=3600,
+from langchain_google_agent_sandbox import (
+    ProviderSessionAgentSandboxBackend,
+    SandboxLease,
 )
+
+
+class MyProvider:
+    def acquire(self, config) -> SandboxLease:
+        # Admission, tenancy, and Claim ownership live in your control plane.
+        session = control_plane.claim_session(config["configurable"]["thread_id"])
+        return SandboxLease(key=session.opaque_id, sandbox=session.sandbox)
+
+    def touch(self, lease: SandboxLease) -> None:
+        control_plane.record_activity(lease.key)
+
+    def close_local(self, lease: SandboxLease) -> None:
+        lease.sandbox.close_connection()
+
+
+backend = ProviderSessionAgentSandboxBackend(MyProvider())
 agent = create_deep_agent(model=model, backend=backend)
 agent.invoke(
     {"messages": [("user", "Create data.csv")]},
     config={"configurable": {"thread_id": "thread-123"}},
 )
 ```
+
+See `docs/adr/0001-provider-owned-session-lifecycle.md` for why, and the
+package README for the full migration table.
 
 ## Policy Wrapper
 

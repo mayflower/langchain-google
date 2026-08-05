@@ -44,11 +44,24 @@ FORBIDDEN_ATTRIBUTES = {
     "send_request",
 }
 
-#: Fork coordinates that must never reappear anywhere in the package.
+#: Fork coordinates that must never reappear anywhere in the package. Kept
+#: identical to FORBIDDEN_STRINGS in scripts/assert_upstream_agent_sandbox.py;
+#: an earlier version of this list omitted the bare form and was consequently
+#: weaker than the build guard.
 FORK_COORDINATES = (
     "github.com/mayflower/agent-sandbox",
+    "mayflower/agent-sandbox",
     "a2419b9b7eaeec99f636c46a46ca55731d3f52fc",
 )
+
+#: Files permitted to name the coordinates, because naming them is their job:
+#: two guards that forbid them and the ADR that records why they were dropped.
+#: Anything else mentioning a fork coordinate is a regression.
+HISTORICAL_REFERENCES = {
+    "assert_upstream_agent_sandbox.py",
+    "test_architecture.py",
+    "0001-provider-owned-session-lifecycle.md",
+}
 
 #: Methods the fork added and upstream never had. Their return would mean the
 #: adapter had taken durable lifecycle back from the provider.
@@ -86,8 +99,8 @@ def test_no_fork_coordinates_anywhere_in_the_package() -> None:
             continue
         if any(part in SKIP_DIRS for part in path.parts):
             continue
-        if path.name in {"assert_upstream_agent_sandbox.py", "test_architecture.py"}:
-            continue  # These name the coordinates in order to forbid them.
+        if path.name in HISTORICAL_REFERENCES:
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):

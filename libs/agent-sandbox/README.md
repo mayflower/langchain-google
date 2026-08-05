@@ -10,8 +10,42 @@ Looking for the JS/TS version? Check out [LangChain.js](https://github.com/langc
 `langchain-google-agent-sandbox` provides a DeepAgents backend for
 Kubernetes `k8s-agent-sandbox` runtimes. It lets LangChain agents run tools in
 Kubernetes-native sandboxes while keeping the package itself importable without
-a Kubernetes cluster. The package implements the DeepAgents 0.7 backend
-protocols and requires DeepAgents 0.7.0b2 or newer.
+a Kubernetes cluster. It implements the DeepAgents 0.7 backend protocols and
+requires `deepagents>=0.7.4` and `k8s-agent-sandbox==0.5.4`.
+
+## What this package is, and is not
+
+**This is a DeepAgents protocol adapter, not a sandbox control plane.**
+
+It owns exactly five things: protocol translation, path normalization and
+bounded result mapping, a process-local session cache, reattachment after a
+stale local handle, and local connector shutdown.
+
+It does **not** decide product admission, derive Kubernetes Claim ownership,
+renew leases, delete durable sessions, inspect Pods or PVCs, or use private SDK
+internals. Durable session lifecycle is **owned by the consuming product** and
+supplied through a [`SandboxSessionProvider`](#durable-session-backend).
+
+A few consequences worth stating plainly:
+
+- The official `k8s-agent-sandbox` SDK and the agent-sandbox operator are used
+  **unchanged**. No fork, no vendored files, no import-time patching.
+- **Closing an adapter never deletes durable infrastructure.** Eviction and
+  shutdown release local client resources only.
+- Do not put raw tenant or user identity in Claim labels. Identity mapping
+  belongs to the provider, which should hand this package an already-opaque
+  lease key.
+- **Strong isolation comes from the runtime, operator, and Kubernetes policy**,
+  not from this package. The path virtualization here is ergonomics, not a
+  security boundary.
+- **Cancelling an async call does not cancel the remote process.** The async
+  methods wrap synchronous SDK calls; abandoning the awaitable abandons the
+  local wait, and the command keeps running in the sandbox.
+- **Large-file streaming is not implemented.** The bounded upload/download
+  operations are the supported transfer path; move large artifacts through a
+  separate service boundary.
+- Migration to an eventual upstream DeepAgents integration is expected. None
+  exists on PyPI today.
 
 ## Quick Install
 
@@ -50,10 +84,11 @@ with AgentSandboxBackend.from_warm_pool(
 ```python
 from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
+    ProviderSessionAgentSandboxBackend,
+    SandboxLease,
     SandboxPolicyWrapper,
-    SessionAgentSandboxBackend,
-    SessionLifecycleContext,
-    SessionSandboxEndpoint,
+    SandboxResultLimits,
+    SandboxSessionProvider,
     create_sandbox_backend,
     create_sandbox_backend_factory,
 )
@@ -62,6 +97,11 @@ from langchain_google_agent_sandbox import (
 `create_sandbox_backend_factory` is a deprecated compatibility name. In
 DeepAgents 0.7 it returns a concrete backend instance because callable backend
 factories are no longer supported.
+
+`SessionAgentSandboxBackend` remains importable as a deprecated alias for
+`ProviderSessionAgentSandboxBackend` for one migration release. It warns on
+construction and **does not** preserve the old lifecycle behavior; see
+[Migration](#migration-from-the-pre-provider-api).
 
 ## Existing Sandboxes
 
@@ -91,28 +131,59 @@ with AgentSandboxBackend.from_warm_pool(
 `from_template` remains as a deprecated compatibility alias for
 `from_warm_pool`.
 
+!!! warning "Ephemeral only"
+    `from_warm_pool` creates an SDK-named Claim and **deletes it on context
+    exit**. It is unsuitable for durable thread persistence. It also no longer
+    accepts `session_id`: adopting an existing Claim by label was a
+    control-plane decision about which persistent filesystem an agent receives,
+    and that decision now belongs to the provider.
+
 ## Durable Session Backend
 
-Use one `SessionAgentSandboxBackend` instance directly in DeepAgents or as the
-default of a `CompositeBackend`. It reads `configurable.thread_id` from the
-active LangGraph config, HMACs the raw identity with a stable secret, and uses
-the resulting opaque value for the deterministic Claim name and selector
-label. Raw session values are never sent to Kubernetes.
+Durable sessions are supplied by **your product**, through a
+`SandboxSessionProvider`. This package caches the lease you return and
+translates DeepAgents calls onto it. It never creates, renames, labels, renews,
+lists, or deletes a Claim, and never derives a Claim name or hashes identity.
+
+```python
+from collections.abc import Mapping
+from typing import Any
+
+from langchain_google_agent_sandbox import SandboxLease
+
+
+class MyControlPlaneProvider:
+    """Talks to the product's own sandbox control-plane service."""
+
+    def acquire(self, config: Mapping[str, Any]) -> SandboxLease:
+        thread_id = config["configurable"]["thread_id"]
+        # Admission, tenant mapping, quota, and Claim ownership all live here.
+        session = control_plane.claim_session(thread_id)
+        return SandboxLease(
+            key=session.opaque_id,
+            sandbox=session.sandbox,
+            claim_name=session.claim_name,
+            namespace=session.namespace,
+        )
+
+    def touch(self, lease: SandboxLease) -> None:
+        control_plane.record_activity(lease.key)
+
+    def close_local(self, lease: SandboxLease) -> None:
+        lease.sandbox.close_connection()
+```
+
+Wire it in like any other backend:
 
 ```python
 from deepagents import create_deep_agent
-from k8s_agent_sandbox import SandboxClient
-from langchain_google_agent_sandbox import SessionAgentSandboxBackend
+from langchain_google_agent_sandbox import ProviderSessionAgentSandboxBackend
 
-backend = SessionAgentSandboxBackend(
-    SandboxClient(cleanup=False),
-    warm_pool="python-deepagent-pool",
-    namespace="default",
-    session_secret=os.environ["SANDBOX_SESSION_SECRET"],
-    idle_ttl_seconds=3600,
-    renewal_threshold_seconds=600,
+backend = ProviderSessionAgentSandboxBackend(
+    MyControlPlaneProvider(),
     local_cache_ttl_seconds=300,
     max_cached_sessions=128,
+    touch_interval_seconds=60,
 )
 agent = create_deep_agent(model=model, backend=backend)
 
@@ -122,66 +193,95 @@ agent.invoke(
 )
 ```
 
-For tenant-aware applications, pass a resolver that combines tenant and thread
-identity before HMAC encoding:
+### What the adapter guarantees
+
+- `acquire()` is called **only** when no usable process-local lease is cached.
+  Concurrent first use of one session coalesces into a single call.
+- Two different sessions may never share one lease. If a provider returns a
+  lease key already held by another session, acquisition is refused rather than
+  serving one agent another agent's filesystem.
+- `touch()` is throttled to at most one call per `touch_interval_seconds`. It is
+  never called once per file operation, and a failure is logged without failing
+  the agent's operation.
+- On `SandboxNotFoundError` the stale lease is dropped and re-acquired **exactly
+  once**. A second failure propagates; there is no retry loop.
+- `SandboxClaimFailedError` is terminal. It reports a `Ready=False` reason the
+  controller will not retry, so it propagates without a re-acquire.
+- Eviction (`local_cache_ttl_seconds`, `max_cached_sessions`) and `close()` call
+  `close_local()` only. **No code path here deletes a Claim.**
+- Provider errors propagate unchanged, so an admission refusal reaches the
+  caller with the product's own message.
+
+### Session identity
+
+By default the cache key is `configurable.thread_id`. Pass `session_resolver`
+to scope it differently:
 
 ```python
-def resolve_session(config):
-    values = config["configurable"]
-    return f"{values['tenant_id']}\0{values['thread_id']}"
-```
-
-The SDK and Kubernetes object uniqueness coordinate get-or-create across
-replicas. Process-local locks only coalesce duplicate calls in one process.
-Closing the backend, completing a graph, or exiting the process closes local
-connectors and does not delete Claims. Use `delete_session(raw_session_id)` for
-explicit deletion. The configured idle TTL is renewed near expiry, while the
-agent-sandbox controller remains the authority that deletes abandoned Claims.
-Idle local cache entries close only their process-local connector after
-`local_cache_ttl_seconds`; a later operation reattaches to the existing Claim.
-Set this option to `None` only when the application bounds its session set by
-other means. `max_cached_sessions` additionally applies an LRU-style hard bound
-to process-local connectors without deleting Claims.
-
-Lifecycle hooks receive only the opaque session ID and the concrete backend:
-
-- `on_session_created`: initialize a genuinely new Claim;
-- `on_session_attached`: observe reattachment without restoring again;
-- `before_session_deleted`: flush state before explicit deletion.
-
-Consumers that need external admission or durable lifecycle bookkeeping can
-use the generic hooks and their immutable `SessionLifecycleContext`:
-
-```python
-def admit(context: SessionLifecycleContext) -> None:
-    if capacity_is_full(context.raw_session_id):
-        raise CapacityUnavailableError("sandbox capacity is full")
-
-
-backend = SessionAgentSandboxBackend(
-    SandboxClient(cleanup=False),
-    warm_pool="python-deepagent-pool",
-    session_secret=os.environ["SANDBOX_SESSION_SECRET"],
-    before_session_acquire=admit,
-    after_session_acquire=lambda context, backend, created: record_claim(
-        context.claim_name, created=created
+backend = ProviderSessionAgentSandboxBackend(
+    provider,
+    session_resolver=lambda config: (
+        f"{config['configurable']['tenant_id']}/{config['configurable']['thread_id']}"
     ),
-    on_session_accessed=lambda context: record_access(context.opaque_session_id),
-    after_session_deleted=lambda context: record_deletion(context.claim_name),
 )
 ```
 
-Lifecycle callbacks are synchronous. `before_session_acquire` may reject an
-acquisition before any Kubernetes request is made. Error callbacks are
-best-effort observers and never replace the original acquisition or deletion
-exception. Keep `on_session_accessed` cheap and throttle durable writes in the
-consumer. The legacy `on_session_created`, `on_session_attached`, and
-`before_session_deleted` hooks retain their existing signatures and behavior.
+This value is a **process-local cache key only**. It is never sent to
+Kubernetes and never turned into a Claim name. Mapping identity to durable
+infrastructure is the provider's job, and the provider should return an already
+opaque `SandboxLease.key`.
 
-Endpoint-aware integrations can call `get_session_sandbox()`,
-`get_session_claim_name()`, and `get_session_endpoint(port,
-prefer_pod_ip=False)`. An optional legacy-label fallback attaches only when
-exactly one migrated random-name Claim matches; ambiguity fails closed.
+### Bounding results
+
+Every unbounded result is capped and reported through the protocol's own
+truncation indicators, never silently dropped:
+
+```python
+from langchain_google_agent_sandbox import SandboxResultLimits
+
+limits = SandboxResultLimits(
+    execute_output_bytes=1_048_576,
+    read_lines=10_000,
+    grep_matches=1_000,
+    glob_matches=1_000,
+    upload_files=100,
+    download_files=100,
+)
+backend = ProviderSessionAgentSandboxBackend(provider, limits=limits)
+```
+
+A capped `read` reports the remainder via `next_offset`; `grep` and `glob` set
+`truncated`; `execute` sets `truncated` and clips on the UTF-8 encoding so a
+bound landing mid-character cannot produce invalid text. Upload and download
+return one response per requested file, with a `limit_exceeded` error for those
+past the bound.
+
+## Migration from the pre-provider API
+
+The previous `SessionAgentSandboxBackend` owned session lifecycle directly.
+That responsibility moved to the provider. Removed arguments are **rejected
+with a `TypeError`** naming their replacement rather than being silently
+ignored:
+
+| Removed | Replacement |
+|---|---|
+| `client=` | product `SandboxSessionProvider` |
+| `warm_pool=` | provider/control-plane configuration |
+| `session_secret=` | provider-owned identity mapping |
+| `namespace=` | provider/control-plane configuration |
+| `sandbox_ready_timeout=`, `labels=` | provider/control-plane configuration |
+| `idle_ttl_seconds=`, `renewal_threshold_seconds=` | provider-owned lease lifetime and renewal |
+| `legacy_label_fallback=` | removed; the provider owns session discovery |
+| `before_session_acquire=` | provider admission (raise from `acquire()`) |
+| `after_session_acquire=`, `on_session_created=`, `on_session_attached=` | provider workspace preparation/eventing |
+| `on_session_accessed=` | throttled provider `touch()` |
+| `before_session_deleted=`, `after_session_deleted=` | product control-plane close operation |
+| `on_session_acquire_error=`, `on_session_delete_error=` | provider error handling |
+| `delete_session()` | product control-plane close operation |
+| `get_session_endpoint()`, `get_session_claim_name()`, `get_session_sandbox()` | `get_session_lease()`, or a separate endpoint API |
+| `opaque_session_id()` | `SandboxLease.key`, chosen by the provider |
+| `AgentSandboxBackend.delete_all()` | product control-plane operation |
+| `AgentSandboxBackend.from_warm_pool(session_id=...)` | provider-owned session discovery |
 
 ## DeepAgents 0.7 Backend
 
@@ -271,11 +371,20 @@ Supported environment variables:
 
 This package targets the complete DeepAgents 0.7 backend protocol family:
 structured file operations, recursive deletion, paginated reads, bounded grep,
-glob matching, uploads/downloads, and sandbox execution. It uses public v1beta1
-`k8s-agent-sandbox` APIs only. Claim creation, atomic get-or-create, readiness,
-validation, renewal, deletion, and endpoint metadata remain SDK
-responsibilities. The adapter never issues raw `CustomObjectsApi` calls and has
-no v1alpha1 fallback.
+glob matching, uploads/downloads, and sandbox execution.
+
+It calls **only public** `k8s-agent-sandbox` APIs, and only methods that exist
+on the official `SandboxClient`. Claim readiness, validation, and endpoint
+metadata remain SDK responsibilities; Claim ownership, renewal, and deletion
+are the provider's. The adapter never issues raw `CustomObjectsApi` calls,
+never touches `k8s_helper` or a connector, and declares no Kubernetes client
+dependency of its own.
+
+Three fences enforce this in CI: a string provenance guard, an AST import
+fence, and a client-method allowlist derived by introspecting the installed
+SDK. `scripts/assert_upstream_agent_sandbox.py` additionally fails the build if
+the dependency drifts off the exact PyPI pin or reintroduces a direct
+reference.
 
 ## Troubleshooting
 

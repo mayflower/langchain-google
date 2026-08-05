@@ -43,6 +43,15 @@ FORBIDDEN_STRINGS = (
     "a2419b9b7eaeec99f636c46a46ca55731d3f52fc",
 )
 
+#: Files permitted to name the coordinates, because naming them is their job:
+#: this guard, the architecture fence, and the ADR recording why the fork was
+#: dropped. Anything else mentioning one is a regression.
+HISTORICAL_REFERENCES = {
+    "assert_upstream_agent_sandbox.py",
+    "test_architecture.py",
+    "0001-provider-owned-session-lifecycle.md",
+}
+
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 #: Only text worth scanning; skip caches, virtualenvs, and build output.
@@ -161,8 +170,8 @@ def check_no_fork_references(root: Path) -> None:
             continue
         if any(part in SKIP_DIRS for part in path.parts):
             continue
-        if path.resolve() == Path(__file__).resolve():
-            continue  # This guard names the strings it forbids.
+        if path.name in HISTORICAL_REFERENCES:
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
