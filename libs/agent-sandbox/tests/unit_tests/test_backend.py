@@ -547,29 +547,27 @@ def test_compat_create_uses_v1beta1_sdk_contract() -> None:
     }
 
 
-def test_compat_requires_public_sdk_list_method() -> None:
-    with pytest.raises(AttributeError):
-        _compat.list_sandbox_claims(
-            SimpleNamespace(), namespace="ns", label_selector="x=y"
-        )
+@pytest.mark.parametrize(
+    "removed",
+    [
+        "list_sandbox_claims",
+        "get_sandbox",
+        "validate_label_value",
+        "SESSION_LABEL_KEY",
+        "_claim_names",
+    ],
+)
+def test_compat_no_longer_wraps_claim_discovery(removed: str) -> None:
+    """Claim listing and adoption moved to the provider and must not return."""
+    assert not hasattr(_compat, removed)
 
 
-def test_template_validation_when_metadata_is_available() -> None:
-    sandbox = SimpleNamespace()
+def test_compat_only_calls_official_sdk_methods() -> None:
+    """Every method _compat forwards to must exist on the official client."""
+    from k8s_agent_sandbox.sandbox_client import SandboxClient
 
-    class Client:
-        def get_sandbox_claim_warmpool_name(
-            self, claim_name: str, namespace: str
-        ) -> str:
-            return "other"
-
-        def get_sandbox(self, claim_name: str, namespace: str = "default") -> Any:
-            return sandbox
-
-    with pytest.raises(ValueError, match="does not match"):
-        _compat.get_sandbox(
-            Client(), claim_name="claim", namespace="ns", warm_pool="wanted"
-        )
+    for method in ("create_sandbox", "delete_sandbox"):
+        assert hasattr(SandboxClient, method)
 
 
 def test_from_template_is_deprecated_alias() -> None:

@@ -16,7 +16,10 @@ from deepagents.backends import CompositeBackend
 from deepagents.backends.protocol import SandboxBackendProtocol
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
-from k8s_agent_sandbox.exceptions import SandboxNotFoundError
+from k8s_agent_sandbox.exceptions import (
+    SandboxClaimFailedError,
+    SandboxNotFoundError,
+)
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 
@@ -354,33 +357,47 @@ def test_second_missing_sandbox_propagates_without_retry_loop() -> None:
     assert provider.acquire_calls == ["t1", "t1"]
 
 
-def test_sibling_sdk_errors_do_not_trigger_a_reacquire() -> None:
-    """Only a missing sandbox is retryable; sibling SDK errors are terminal.
+def test_terminal_claim_failure_is_not_retried() -> None:
+    """SandboxClaimFailedError is terminal and must not drive a re-acquire.
 
-    This guards the narrow ``except SandboxNotFoundError`` in ``_invoke``. A
-    sibling such as SandboxClaimFailedError reports a state the controller
-    will not retry, so re-acquiring would be pointless churn. Asserted against
-    the wrapped backend directly because the concrete backend deliberately
-    converts non-SandboxNotFoundError command failures into error results.
+    It reports a Ready=False reason the claim controller will not retry
+    (InvalidMetadata, VolumeClaimTemplatesError, ClaimExpired), so re-acquiring
+    would be pointless churn. This guards the narrow ``except
+    SandboxNotFoundError`` in ``_invoke``: the two are siblings under
+    SandboxError, and a broader catch would swallow this one.
+
+    Asserted against the wrapped backend because the concrete backend
+    deliberately converts non-SandboxNotFoundError command failures into error
+    results rather than raising.
     """
-
-    class TerminalError(RuntimeError):
-        pass
-
     provider = RecordingProvider()
     backend = make_backend(provider)
     pinned(backend, "t1")
     entry = backend._entry(config_for("t1"))
 
     def terminal(*args: Any, **kwargs: Any) -> Any:
-        raise TerminalError("claim will never be ready")
+        raise SandboxClaimFailedError("claim will never become ready")
 
     entry.backend.execute = terminal  # type: ignore[method-assign]
 
-    with pytest.raises(TerminalError):
+    with pytest.raises(SandboxClaimFailedError):
         backend.execute("echo hi")
     # No second acquisition: the error was never treated as staleness.
     assert provider.acquire_calls == ["t1"]
+
+
+def test_terminal_and_stale_errors_are_distinct_siblings() -> None:
+    """The retry rule depends on these not being in an inheritance relation."""
+    assert not issubclass(SandboxClaimFailedError, SandboxNotFoundError)
+    assert not issubclass(SandboxNotFoundError, SandboxClaimFailedError)
+
+
+def test_provider_terminal_error_during_acquire_propagates() -> None:
+    backend = make_backend(
+        RecordingProvider(acquire_error=SandboxClaimFailedError("terminal"))
+    )
+    with pytest.raises(SandboxClaimFailedError, match="terminal"):
+        backend._entry(config_for("t1"))
 
 
 # --- lifecycle boundary ------------------------------------------------------

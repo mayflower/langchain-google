@@ -840,13 +840,17 @@ wheels = [
 
 [[package]]
 name = "k8s-agent-sandbox"
-version = "0.1.dev657+ga2419b9b7"
-source = { git = "https://github.com/mayflower/agent-sandbox.git?subdirectory=clients%2Fpython%2Fagentic-sandbox-client&rev=a2419b9b7eaeec99f636c46a46ca55731d3f52fc#a2419b9b7eaeec99f636c46a46ca55731d3f52fc" }
+version = "0.5.4"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "kubernetes" },
     { name = "prometheus-client" },
     { name = "pydantic" },
     { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9a/be/b7cd4abda7ceadbdbf438e98ee46d3d5b897ab63b640f2e57a5efafd9dbb/k8s_agent_sandbox-0.5.4.tar.gz", hash = "sha256:e751221faca8efc95c29e98849ea6e98abb8f32bfae00f16d652ea7aa0e30279", size = 146422, upload-time = "2026-07-30T18:37:41.071Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/6f/142499c8c0691040d0ecd904cf07d455ed7660c9f545e6305f40558cb356/k8s_agent_sandbox-0.5.4-py3-none-any.whl", hash = "sha256:edf3d2232f2cbef8c9537f4d132caeabf6eb4ac24d0b4b3948f3702fb7674132", size = 80622, upload-time = "2026-07-30T18:37:39.969Z" },
 ]
 
 [[package]]
@@ -945,7 +949,7 @@ typing = [
 [package.metadata]
 requires-dist = [
     { name = "deepagents", specifier = ">=0.7.4,<0.8.0" },
-    { name = "k8s-agent-sandbox", git = "https://github.com/mayflower/agent-sandbox.git?subdirectory=clients%2Fpython%2Fagentic-sandbox-client&rev=a2419b9b7eaeec99f636c46a46ca55731d3f52fc" },
+    { name = "k8s-agent-sandbox", specifier = "==0.5.4" },
     { name = "wcmatch", specifier = ">=11.0,<12.0" },
 ]
 
