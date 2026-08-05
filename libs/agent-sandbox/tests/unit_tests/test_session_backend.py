@@ -1,6 +1,10 @@
+"""Tests for the provider-backed session backend."""
+
 from __future__ import annotations
 
 import threading
+import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
@@ -12,22 +16,20 @@ from deepagents.backends import CompositeBackend
 from deepagents.backends.protocol import SandboxBackendProtocol
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
-from k8s_agent_sandbox.acquisition import SandboxAcquisition
 from k8s_agent_sandbox.exceptions import SandboxNotFoundError
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 
 from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
+    ProviderSessionAgentSandboxBackend,
     SandboxPolicyWrapper,
     SessionAgentSandboxBackend,
-    SessionLifecycleContext,
-    SessionSandboxEndpoint,
     default_session_resolver,
 )
-from langchain_google_agent_sandbox._compat import SESSION_LABEL_KEY
+from langchain_google_agent_sandbox.provider import SandboxLease
 from langchain_google_agent_sandbox.session_backend import _SessionEntry
-from tests.unit_tests.test_backend import StubCommands, StubSandbox, result
+from tests.unit_tests.test_backend import StubSandbox, result
 
 
 class ToolCallingFakeModel(FakeMessagesListChatModel):
@@ -36,553 +38,475 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         return self
 
 
-class SessionStubClient:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
+def config_for(thread_id: str) -> dict[str, Any]:
+    return {"configurable": {"thread_id": thread_id}}
+
+
+class RecordingProvider:
+    """In-memory SandboxSessionProvider standing in for a product control plane.
+
+    It keeps one sandbox per thread id so a re-acquire after eviction returns
+    the same durable workspace, exactly as a real control plane would.
+    """
+
+    def __init__(self, *, acquire_error: Exception | None = None) -> None:
+        self.acquire_calls: list[str] = []
+        self.touched: list[str] = []
+        self.closed_local: list[str] = []
+        self.acquire_error = acquire_error
         self.sandboxes: dict[str, StubSandbox] = {}
-        self.labels: dict[str, dict[str, str]] = {}
-        self.warm_pools: dict[str, str] = {}
-        self.acquire_count = 0
-        self.list_count = 0
-        self.deleted: list[tuple[str, str]] = []
-        self.renewed: list[tuple[str, str, int]] = []
+        self._lock = threading.Lock()
 
-    def get_or_create_sandbox(
-        self,
-        *,
-        warmpool: str,
-        namespace: str,
-        sandbox_ready_timeout: int,
-        labels: dict[str, str] | None,
-        claim_name: str,
-        required_labels: dict[str, str],
-        shutdown_after_seconds: int | None,
-    ) -> SandboxAcquisition[StubSandbox]:
-        del sandbox_ready_timeout, shutdown_after_seconds
-        with self.lock:
-            self.acquire_count += 1
-            created = claim_name not in self.sandboxes
-            sandbox = self.sandboxes.get(claim_name)
+    def acquire(self, config: Mapping[str, Any]) -> SandboxLease:
+        thread_id = default_session_resolver(config)
+        if self.acquire_error is not None:
+            raise self.acquire_error
+        with self._lock:
+            self.acquire_calls.append(thread_id)
+            sandbox = self.sandboxes.get(thread_id)
             if sandbox is None or sandbox.closed:
-                sandbox = StubSandbox(claim_name=claim_name, namespace=namespace)
-                self.sandboxes[claim_name] = sandbox
-            if created:
-                self.labels[claim_name] = {**(labels or {}), **required_labels}
-                self.warm_pools[claim_name] = warmpool
-            else:
-                assert self.warm_pools[claim_name] == warmpool
-                assert all(
-                    self.labels[claim_name].get(key) == value
-                    for key, value in required_labels.items()
-                )
-            return SandboxAcquisition(
-                sandbox=sandbox,
-                created=created,
-                claim_name=claim_name,
-                sandbox_id=sandbox.sandbox_id,
-                namespace=namespace,
-            )
+                sandbox = StubSandbox(claim_name=f"claim-{thread_id}")
+                self.sandboxes[thread_id] = sandbox
+        return SandboxLease(
+            key=f"lease-{thread_id}",
+            sandbox=sandbox,
+            claim_name=f"claim-{thread_id}",
+            namespace="tenant",
+        )
 
-    def list_all_sandboxes(
-        self, namespace: str, label_selector: str | None = None
-    ) -> list[str]:
-        del namespace
-        self.list_count += 1
-        if label_selector is None:
-            return list(self.sandboxes)
-        key, value = label_selector.split("=", 1)
-        return [
-            claim for claim, labels in self.labels.items() if labels.get(key) == value
-        ]
+    def touch(self, lease: SandboxLease) -> None:
+        self.touched.append(lease.key)
 
-    def get_sandbox_claim_warmpool_name(self, claim_name: str, namespace: str) -> str:
-        del namespace
-        if claim_name not in self.warm_pools:
-            raise SandboxNotFoundError(claim_name)
-        return self.warm_pools[claim_name]
-
-    def get_sandbox(self, claim_name: str, namespace: str) -> StubSandbox:
-        sandbox = self.sandboxes[claim_name]
-        if sandbox.closed:
-            sandbox = StubSandbox(claim_name=claim_name, namespace=namespace)
-            self.sandboxes[claim_name] = sandbox
-        return sandbox
-
-    def renew_sandbox(
-        self, claim_name: str, namespace: str, shutdown_after_seconds: int
-    ) -> None:
-        if claim_name not in self.sandboxes:
-            raise SandboxNotFoundError(claim_name)
-        self.renewed.append((claim_name, namespace, shutdown_after_seconds))
-
-    def delete_sandbox(self, claim_name: str, namespace: str) -> None:
-        self.deleted.append((claim_name, namespace))
-        self.sandboxes.pop(claim_name, None)
-        self.labels.pop(claim_name, None)
-        self.warm_pools.pop(claim_name, None)
-
-    def add_legacy(self, claim_name: str, opaque_id: str) -> None:
-        self.sandboxes[claim_name] = StubSandbox(claim_name=claim_name)
-        self.labels[claim_name] = {SESSION_LABEL_KEY: opaque_id}
-        self.warm_pools[claim_name] = "python"
+    def close_local(self, lease: SandboxLease) -> None:
+        self.closed_local.append(lease.key)
 
 
 def make_backend(
-    client: SessionStubClient | None = None,
-    **kwargs: Any,
-) -> SessionAgentSandboxBackend:
-    return SessionAgentSandboxBackend(
-        client or SessionStubClient(),
-        "python",
-        "stable-secret",
-        **kwargs,
-    )
+    provider: Any = None, **kwargs: Any
+) -> ProviderSessionAgentSandboxBackend:
+    return ProviderSessionAgentSandboxBackend(provider or RecordingProvider(), **kwargs)
 
 
-def test_default_and_custom_session_resolution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = {"configurable": {"thread_id": "thread-1", "tenant": "tenant-a"}}
-    monkeypatch.setattr(
-        SessionAgentSandboxBackend,
-        "_active_config",
-        staticmethod(lambda: config),
-    )
-    backend = make_backend()
-    assert backend.opaque_session_id() == backend.opaque_session_id("thread-1")
-
-    custom = make_backend(
-        session_resolver=lambda value: (
-            f"{value['configurable']['tenant']}\0{value['configurable']['thread_id']}"
-        )
-    )
-    assert custom.opaque_session_id() != custom.opaque_session_id("thread-1")
-    assert default_session_resolver(config) == "thread-1"
+def pinned(backend: ProviderSessionAgentSandboxBackend, thread_id: str) -> None:
+    """Pin the backend's active config, standing in for a LangGraph run."""
+    backend._active_config = staticmethod(lambda: config_for(thread_id))  # type: ignore[assignment]
 
 
-def test_hmac_stability_privacy_and_tenant_isolation() -> None:
-    first = make_backend()
-    second = make_backend()
-    opaque = first.opaque_session_id("tenant-a\0shared-thread")
-    assert opaque == second.opaque_session_id("tenant-a\0shared-thread")
-    assert opaque != first.opaque_session_id("tenant-b\0shared-thread")
-    assert "tenant" not in opaque
-    assert "shared-thread" not in first._claim_name(opaque)
-    assert len(first._claim_name(opaque)) <= 63
+# --- acquisition and caching -------------------------------------------------
 
 
-def test_cross_thread_isolation_and_process_restart(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    active = {"thread_id": "one"}
-    monkeypatch.setattr(
-        SessionAgentSandboxBackend,
-        "_active_config",
-        staticmethod(lambda: {"configurable": active}),
-    )
-    client = SessionStubClient()
-    backend = make_backend(client)
-    first_claim = backend.get_session_claim_name()
-    active["thread_id"] = "two"
-    second_claim = backend.get_session_claim_name()
-    assert first_claim != second_claim
-
-    restarted = make_backend(client)
-    assert restarted.get_session_claim_name("one") == first_claim
-    assert client.acquire_count == 3
+def test_provider_is_called_once_per_session_key() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    for _ in range(4):
+        backend._entry(config_for("t1"))
+    assert provider.acquire_calls == ["t1"]
 
 
-def test_local_concurrent_acquisition_is_coalesced() -> None:
-    client = SessionStubClient()
-    backend = make_backend(client)
+def test_distinct_sessions_never_share_a_lease() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    first = backend.get_session_lease(config_for("t1"))
+    second = backend.get_session_lease(config_for("t2"))
+    assert first.key != second.key
+    assert first.sandbox is not second.sandbox
+    assert sorted(provider.acquire_calls) == ["t1", "t2"]
+
+
+def test_provider_reusing_one_lease_for_two_sessions_is_refused() -> None:
+    """A shared sandbox would cross-contaminate two agents' filesystems."""
+
+    class CollidingProvider(RecordingProvider):
+        def acquire(self, config: Mapping[str, Any]) -> SandboxLease:
+            super().acquire(config)
+            return SandboxLease(key="same-lease", sandbox=StubSandbox())
+
+    backend = make_backend(CollidingProvider())
+    backend._entry(config_for("t1"))
+    with pytest.raises(RuntimeError, match="already held by session"):
+        backend._entry(config_for("t2"))
+
+
+def test_one_acquisition_per_key_under_concurrency() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider)
     with ThreadPoolExecutor(max_workers=8) as executor:
-        claims = list(
+        leases = list(
             executor.map(
-                lambda _: backend.get_session_claim_name("same-session"),
+                lambda _: backend.get_session_lease(config_for("shared")),
                 range(16),
             )
         )
-    assert len(set(claims)) == 1
-    assert client.acquire_count == 1
+    assert {lease.key for lease in leases} == {"lease-shared"}
+    assert provider.acquire_calls == ["shared"]
 
 
-def test_legacy_fallback_and_multiple_match_refusal() -> None:
-    client = SessionStubClient()
-    backend = make_backend(client, legacy_label_fallback=True)
-    opaque = backend.opaque_session_id("legacy")
-    client.add_legacy("sandbox-claim-old", opaque)
-    assert backend.get_session_claim_name("legacy") == "sandbox-claim-old"
-    assert client.acquire_count == 0
-
-    duplicate_client = SessionStubClient()
-    duplicate = make_backend(duplicate_client, legacy_label_fallback=True)
-    opaque = duplicate.opaque_session_id("legacy")
-    duplicate_client.add_legacy("old-a", opaque)
-    duplicate_client.add_legacy("old-b", opaque)
-    with pytest.raises(RuntimeError, match="multiple Claims"):
-        duplicate.get_session_claim_name("legacy")
+def test_concurrent_distinct_sessions_each_acquire_once() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider, max_cached_sessions=64)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(
+            executor.map(
+                lambda index: backend.get_session_lease(config_for(f"s{index}")),
+                range(16),
+            )
+        )
+    assert sorted(provider.acquire_calls) == sorted(f"s{i}" for i in range(16))
 
 
-def test_idle_ttl_renewal_threshold_and_not_found_reacquire(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = [100.0]
-    monkeypatch.setattr(
-        "langchain_google_agent_sandbox.session_backend.time.monotonic",
-        lambda: now[0],
-    )
-    client = SessionStubClient()
-    backend = make_backend(
-        client,
-        idle_ttl_seconds=100,
-        renewal_threshold_seconds=20,
-    )
-    claim = backend.get_session_claim_name("ttl-session")
-    assert len(client.renewed) == 1
-    now[0] = 179.0
-    backend.get_session_claim_name("ttl-session")
-    assert len(client.renewed) == 1
-    now[0] = 180.0
-    backend.get_session_claim_name("ttl-session")
-    assert len(client.renewed) == 2
+def test_acquire_rejects_non_lease_return() -> None:
+    class BadProvider(RecordingProvider):
+        def acquire(self, config: Mapping[str, Any]) -> Any:
+            return "not-a-lease"
 
-    client.sandboxes.pop(claim)
-    now[0] = 260.0
-    backend.get_session_claim_name("ttl-session")
-    assert client.acquire_count == 2
+    backend = make_backend(BadProvider())
+    with pytest.raises(TypeError, match="must return a SandboxLease"):
+        backend._entry(config_for("t1"))
 
 
-def test_operation_not_found_reacquires_without_waiting_for_renewal() -> None:
-    client = SessionStubClient()
-    backend = make_backend(client, idle_ttl_seconds=None)
-    backend._active_config = lambda: {"configurable": {"thread_id": "operation"}}
-    backend.get_session_claim_name()
-    claim = backend.get_session_claim_name()
-    client.sandboxes[claim].commands = StubCommands([SandboxNotFoundError(claim)])
+def test_provider_errors_propagate_unchanged() -> None:
+    class DeniedError(RuntimeError):
+        pass
 
-    response = backend.execute("pwd")
+    denial = DeniedError("capacity full")
+    backend = make_backend(RecordingProvider(acquire_error=denial))
+    with pytest.raises(DeniedError, match="capacity full") as info:
+        backend._entry(config_for("t1"))
+    assert info.value is denial
+
+
+def test_provider_receives_config_not_model_content() -> None:
+    """Callbacks must never be handed raw messages or file contents."""
+    seen: list[Mapping[str, Any]] = []
+
+    class Inspecting(RecordingProvider):
+        def acquire(self, config: Mapping[str, Any]) -> SandboxLease:
+            seen.append(config)
+            return super().acquire(config)
+
+    backend = make_backend(Inspecting())
+    backend._entry(config_for("t1"))
+    assert seen == [config_for("t1")]
+    assert set(seen[0]) == {"configurable"}
+
+
+# --- touch throttling --------------------------------------------------------
+
+
+def test_touch_is_throttled_to_the_configured_interval() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider, touch_interval_seconds=3600)
+    for _ in range(5):
+        backend._entry(config_for("t1"))
+    # Acquisition seeds the interval, so nothing fires inside it.
+    assert provider.touched == []
+
+
+def test_touch_fires_once_the_interval_elapses() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider, touch_interval_seconds=0)
+    for _ in range(3):
+        backend._entry(config_for("t1"))
+    # A zero interval reports every cached access; the acquire itself does not.
+    assert provider.touched == ["lease-t1", "lease-t1"]
+
+
+def test_touch_is_not_called_once_per_file_operation() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider, touch_interval_seconds=3600)
+    pinned(backend, "busy")
+    for _ in range(10):
+        backend.execute("pwd")
+    assert provider.touched == []
+
+
+def test_touch_failure_does_not_break_the_operation() -> None:
+    class FlakyTouch(RecordingProvider):
+        def touch(self, lease: SandboxLease) -> None:
+            raise RuntimeError("control plane down")
+
+    backend = make_backend(FlakyTouch(), touch_interval_seconds=0)
+    backend._entry(config_for("t1"))
+    assert backend._entry(config_for("t1")) is not None
+
+
+# --- eviction ----------------------------------------------------------------
+
+
+def test_ttl_eviction_closes_only_local_resources() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider, local_cache_ttl_seconds=1)
+    entry = backend._entry(config_for("old"))
+    sandbox = entry.lease.sandbox
+
+    entry.last_accessed_at = time.monotonic() - 10
+    backend._entry(config_for("other"))
+
+    assert provider.closed_local == ["lease-old"]
+    assert "old" not in backend._entries
+    assert sandbox.closed is True
+    # The provider was never asked to delete anything.
+    assert not hasattr(provider, "deleted")
+
+
+def test_max_cache_eviction_is_deterministic_oldest_first() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider, max_cached_sessions=2)
+    first = backend._entry(config_for("a"))
+    second = backend._entry(config_for("b"))
+    now = time.monotonic()
+    first.last_accessed_at = now - 100
+    second.last_accessed_at = now - 1
+
+    backend._entry(config_for("c"))
+
+    assert "a" not in backend._entries
+    assert "b" in backend._entries
+    assert provider.closed_local == ["lease-a"]
+
+
+def test_evicted_session_reacquires_the_same_durable_workspace() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider, max_cached_sessions=1)
+    backend._entry(config_for("keep"))
+    backend._entry(config_for("evicts-keep"))
+    assert "keep" not in backend._entries
+
+    lease = backend.get_session_lease(config_for("keep"))
+    assert lease.claim_name == "claim-keep"
+    assert provider.acquire_calls.count("keep") == 2
+
+
+def test_close_session_releases_locally_without_deleting() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    backend._entry(config_for("t1"))
+    backend.close_session(config_for("t1"))
+    assert provider.closed_local == ["lease-t1"]
+    assert backend._entries == {}
+
+
+def test_close_releases_every_session_and_deletes_nothing() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    backend._entry(config_for("t1"))
+    backend._entry(config_for("t2"))
+    backend.close()
+    assert sorted(provider.closed_local) == ["lease-t1", "lease-t2"]
+    assert backend._entries == {}
+    with pytest.raises(RuntimeError, match="is closed"):
+        backend._entry(config_for("t1"))
+
+
+def test_close_local_failure_still_clears_the_cache() -> None:
+    class FailingClose(RecordingProvider):
+        def close_local(self, lease: SandboxLease) -> None:
+            raise RuntimeError("close failed")
+
+    backend = make_backend(FailingClose())
+    backend._entry(config_for("t1"))
+    backend.close()
+    assert backend._entries == {}
+
+
+# --- staleness and retry -----------------------------------------------------
+
+
+def test_missing_sandbox_triggers_exactly_one_reacquire() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    pinned(backend, "t1")
+    entry = backend._entry(config_for("t1"))
+
+    calls: list[str] = []
+
+    def fail_once(command: str, **kwargs: Any) -> Any:
+        calls.append(command)
+        if len(calls) == 1:
+            raise SandboxNotFoundError("gone")
+        return result("ok")
+
+    entry.lease.sandbox.commands.run = fail_once  # type: ignore[method-assign]
+
+    response = backend.execute("echo hi")
 
     assert response.exit_code == 0
-    assert client.acquire_count == 2
+    assert provider.acquire_calls == ["t1", "t1"]
 
 
-def test_local_cache_evicts_connectors_without_deleting_claims(
-    monkeypatch: pytest.MonkeyPatch,
+def test_second_missing_sandbox_propagates_without_retry_loop() -> None:
+    def always_missing(command: str, **kwargs: Any) -> Any:
+        raise SandboxNotFoundError("gone")
+
+    class AlwaysMissingProvider(RecordingProvider):
+        def acquire(self, config: Mapping[str, Any]) -> SandboxLease:
+            lease = super().acquire(config)
+            lease.sandbox.commands.run = always_missing  # type: ignore[method-assign]
+            return lease
+
+    provider = AlwaysMissingProvider()
+    backend = make_backend(provider)
+    pinned(backend, "t1")
+
+    with pytest.raises(SandboxNotFoundError):
+        backend.execute("echo hi")
+    # One acquire, one re-acquire, then the failure surfaces. No loop.
+    assert provider.acquire_calls == ["t1", "t1"]
+
+
+def test_sibling_sdk_errors_do_not_trigger_a_reacquire() -> None:
+    """Only a missing sandbox is retryable; sibling SDK errors are terminal.
+
+    This guards the narrow ``except SandboxNotFoundError`` in ``_invoke``. A
+    sibling such as SandboxClaimFailedError reports a state the controller
+    will not retry, so re-acquiring would be pointless churn. Asserted against
+    the wrapped backend directly because the concrete backend deliberately
+    converts non-SandboxNotFoundError command failures into error results.
+    """
+
+    class TerminalError(RuntimeError):
+        pass
+
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    pinned(backend, "t1")
+    entry = backend._entry(config_for("t1"))
+
+    def terminal(*args: Any, **kwargs: Any) -> Any:
+        raise TerminalError("claim will never be ready")
+
+    entry.backend.execute = terminal  # type: ignore[method-assign]
+
+    with pytest.raises(TerminalError):
+        backend.execute("echo hi")
+    # No second acquisition: the error was never treated as staleness.
+    assert provider.acquire_calls == ["t1"]
+
+
+# --- lifecycle boundary ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "removed",
+    [
+        "delete_session",
+        "get_session_endpoint",
+        "get_session_claim_name",
+        "get_session_sandbox",
+        "opaque_session_id",
+        "_claim_name",
+        "_legacy_claim",
+        "_renew",
+        "SESSION_LABEL_KEY",
+    ],
+)
+def test_backend_exposes_no_claim_lifecycle_surface(removed: str) -> None:
+    assert not hasattr(ProviderSessionAgentSandboxBackend, removed)
+
+
+def test_lease_key_is_passed_through_not_derived() -> None:
+    """The adapter must not hash or transform product identity."""
+    backend = make_backend()
+    pinned(backend, "t1")
+    assert backend.get_session_lease(config_for("t1")).key == "lease-t1"
+    assert backend.id == "agent-sandbox/lease-t1"
+
+
+def test_requires_a_provider() -> None:
+    with pytest.raises(ValueError, match="provider is required"):
+        ProviderSessionAgentSandboxBackend(None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"local_cache_ttl_seconds": 0}, "local_cache_ttl_seconds"),
+        ({"max_cached_sessions": 0}, "max_cached_sessions"),
+        ({"touch_interval_seconds": -1}, "touch_interval_seconds"),
+    ],
+)
+def test_rejects_invalid_cache_configuration(
+    kwargs: dict[str, Any], match: str
 ) -> None:
-    now = [100.0]
-    monkeypatch.setattr(
-        "langchain_google_agent_sandbox.session_backend.time.monotonic",
-        lambda: now[0],
-    )
-    client = SessionStubClient()
-    backend = make_backend(client, local_cache_ttl_seconds=10)
-    first_claim = backend.get_session_claim_name("first")
-    first_sandbox = client.sandboxes[first_claim]
-
-    now[0] = 111.0
-    backend.get_session_claim_name("second")
-
-    assert first_sandbox.closed
-    assert first_claim in client.sandboxes
-    assert client.deleted == []
-    assert backend.opaque_session_id("first") not in backend._entries
+    with pytest.raises(ValueError, match=match):
+        make_backend(**kwargs)
 
 
-def test_local_cache_is_bounded_without_claim_deletion() -> None:
-    client = SessionStubClient()
+# --- deprecated alias --------------------------------------------------------
+
+
+def test_deprecated_alias_warns_but_works() -> None:
+    with pytest.warns(DeprecationWarning, match="ProviderSessionAgentSandboxBackend"):
+        backend = SessionAgentSandboxBackend(RecordingProvider())
+    assert backend.get_session_lease(config_for("t1")).key == "lease-t1"
+
+
+@pytest.mark.parametrize(
+    "removed",
+    [
+        "client",
+        "warm_pool",
+        "session_secret",
+        "namespace",
+        "before_session_acquire",
+        "after_session_acquire",
+        "on_session_accessed",
+        "on_session_created",
+        "idle_ttl_seconds",
+        "legacy_label_fallback",
+    ],
+)
+def test_deprecated_alias_rejects_removed_lifecycle_arguments(removed: str) -> None:
+    """Removed arguments must fail loudly, not vanish into **kwargs."""
+    with pytest.raises(TypeError, match=removed):
+        SessionAgentSandboxBackend(RecordingProvider(), **{removed: "x"})
+
+
+def test_default_session_resolver_requires_thread_id() -> None:
+    assert default_session_resolver(config_for("t1")) == "t1"
+    with pytest.raises(RuntimeError, match="thread_id is required"):
+        default_session_resolver({"configurable": {}})
+    with pytest.raises(RuntimeError, match="must be a mapping"):
+        default_session_resolver({"configurable": "nope"})
+
+
+def test_custom_session_resolver_scopes_the_cache_key() -> None:
+    provider = RecordingProvider()
     backend = make_backend(
-        client,
-        local_cache_ttl_seconds=None,
-        max_cached_sessions=1,
+        provider,
+        session_resolver=lambda config: config["configurable"]["thread_id"].upper(),
     )
-    first_claim = backend.get_session_claim_name("first")
-    first_sandbox = client.sandboxes[first_claim]
+    backend._entry(config_for("t1"))
+    assert "T1" in backend._entries
 
-    backend.get_session_claim_name("second")
 
-    assert first_sandbox.closed
-    assert first_claim in client.sandboxes
-    assert len(backend._entries) == 1
-    assert client.deleted == []
+# --- DeepAgents integration --------------------------------------------------
 
 
 def test_policy_wrapper_accepts_session_backend() -> None:
     backend = make_backend()
-    backend._active_config = lambda: {"configurable": {"thread_id": "policy"}}
+    pinned(backend, "policy")
     wrapped = SandboxPolicyWrapper(backend, deny_prefixes=["/etc"])
 
     assert wrapped.write("/etc/passwd", "blocked").error.startswith("Policy denied")
     assert wrapped.write("/allowed.txt", "ok").error is None
 
 
-def test_created_attached_delete_hooks_and_close_semantics() -> None:
-    client = SessionStubClient()
-    events: list[tuple[str, str]] = []
-    backend = make_backend(
-        client,
-        on_session_created=lambda opaque, value: events.append(("created", opaque)),
-        on_session_attached=lambda opaque, value: events.append(("attached", opaque)),
-        before_session_deleted=lambda opaque, value: events.append(("deleted", opaque)),
-    )
-    claim = backend.get_session_claim_name("hook-session")
-    opaque = backend.opaque_session_id("hook-session")
-    assert events == [("created", opaque)]
-
-    backend.close_session("hook-session")
-    assert client.deleted == []
-    backend.get_session_claim_name("hook-session")
-    assert events[-1] == ("attached", opaque)
-
-    backend.delete_session("hook-session")
-    assert events[-1] == ("deleted", opaque)
-    assert client.deleted == [(claim, "default")]
-
-    backend.get_session_claim_name("other")
-    backend.close()
-    assert client.deleted == [(claim, "default")]
-
-
-def test_lifecycle_callback_order_context_and_created_values() -> None:
-    client = SessionStubClient()
-    events: list[tuple[str, str, bool | None]] = []
-
-    def record_context(
-        name: str, context: SessionLifecycleContext, created: bool | None = None
-    ) -> None:
-        assert context.raw_session_id == "lifecycle"
-        assert context.namespace == "default"
-        assert context.warm_pool == "python"
-        assert context.claim_name == f"session-{context.opaque_session_id}"
-        events.append((name, context.opaque_session_id, created))
-
-    backend = make_backend(
-        client,
-        before_session_acquire=lambda context: record_context("before", context),
-        on_session_created=lambda opaque, value: events.append(
-            ("legacy-created", opaque, None)
-        ),
-        on_session_attached=lambda opaque, value: events.append(
-            ("legacy-attached", opaque, None)
-        ),
-        after_session_acquire=lambda context, value, created: record_context(
-            "after", context, created
-        ),
-        on_session_accessed=lambda context: record_context("accessed", context),
-        before_session_deleted=lambda opaque, value: events.append(
-            ("legacy-before-delete", opaque, None)
-        ),
-        after_session_deleted=lambda context: record_context("after-delete", context),
-    )
-
-    backend.get_session_claim_name("lifecycle")
-    opaque = backend.opaque_session_id("lifecycle")
-    assert events == [
-        ("before", opaque, None),
-        ("legacy-created", opaque, None),
-        ("after", opaque, True),
-        ("accessed", opaque, None),
-    ]
-
-    events.clear()
-    backend.get_session_claim_name("lifecycle")
-    assert events == [("accessed", opaque, None)]
-
-    events.clear()
-    backend.close_session("lifecycle")
-    backend.get_session_claim_name("lifecycle")
-    assert events == [
-        ("before", opaque, None),
-        ("legacy-attached", opaque, None),
-        ("after", opaque, False),
-        ("accessed", opaque, None),
-    ]
-
-    events.clear()
-    backend.delete_session("lifecycle")
-    assert events == [
-        ("legacy-before-delete", opaque, None),
-        ("after-delete", opaque, None),
-    ]
-
-
-def test_pre_acquire_denial_makes_no_sdk_calls() -> None:
-    client = SessionStubClient()
-    denied = RuntimeError("consumer denied")
-    errors: list[tuple[SessionLifecycleContext, Exception]] = []
-    backend = make_backend(
-        client,
-        legacy_label_fallback=True,
-        before_session_acquire=lambda context: (_ for _ in ()).throw(denied),
-        on_session_acquire_error=lambda context, error: errors.append((context, error)),
-    )
-
-    with pytest.raises(RuntimeError, match="consumer denied") as exc_info:
-        backend.get_session_claim_name("denied")
-
-    assert exc_info.value is denied
-    assert client.acquire_count == 0
-    assert client.list_count == 0
-    assert client.sandboxes == {}
-    assert client.deleted == []
-    assert client.renewed == []
-    assert len(errors) == 1
-    assert errors[0][0].raw_session_id == "denied"
-    assert errors[0][1] is denied
-
-
-def test_after_acquire_failure_cleanup_depends_on_claim_ownership() -> None:
-    new_client = SessionStubClient()
-
-    def fail_after(
-        context: SessionLifecycleContext,
-        backend: AgentSandboxBackend,
-        created: bool,
-    ) -> None:
-        del context, backend, created
-        raise RuntimeError("bookkeeping failed")
-
-    new_backend = make_backend(new_client, after_session_acquire=fail_after)
-    with pytest.raises(RuntimeError, match="bookkeeping failed"):
-        new_backend.get_session_claim_name("new")
-    assert len(new_client.deleted) == 1
-
-    existing_client = SessionStubClient()
-    should_fail = False
-
-    def fail_attached(
-        context: SessionLifecycleContext,
-        backend: AgentSandboxBackend,
-        created: bool,
-    ) -> None:
-        del context, backend
-        if should_fail and not created:
-            raise RuntimeError("attach bookkeeping failed")
-
-    existing_backend = make_backend(
-        existing_client, after_session_acquire=fail_attached
-    )
-    claim = existing_backend.get_session_claim_name("existing")
-    existing_backend.close_session("existing")
-    should_fail = True
-
-    with pytest.raises(RuntimeError, match="attach bookkeeping failed"):
-        existing_backend.get_session_claim_name("existing")
-
-    assert existing_client.deleted == []
-    assert claim in existing_client.sandboxes
-    assert existing_client.sandboxes[claim].closed
-
-
-def test_error_callbacks_do_not_mask_acquire_or_delete_errors() -> None:
-    acquire_client = SessionStubClient()
-    acquire_error = ValueError("SDK acquire failed")
-    acquire_client.get_or_create_sandbox = MagicMock(side_effect=acquire_error)
-
-    def fail_error_observer(context: SessionLifecycleContext, error: Exception) -> None:
-        del context, error
-        raise RuntimeError("observer failed")
-
-    acquire_backend = make_backend(
-        acquire_client,
-        on_session_acquire_error=fail_error_observer,
-    )
-    with pytest.raises(ValueError, match="SDK acquire failed") as acquire_info:
-        acquire_backend.get_session_claim_name("broken-acquire")
-    assert acquire_info.value is acquire_error
-
-    delete_client = SessionStubClient()
-    delete_backend = make_backend(
-        delete_client,
-        on_session_delete_error=fail_error_observer,
-    )
-    delete_backend.get_session_claim_name("broken-delete")
-    delete_error = ValueError("SDK delete failed")
-    delete_client.delete_sandbox = MagicMock(side_effect=delete_error)
-    with pytest.raises(ValueError, match="SDK delete failed") as delete_info:
-        delete_backend.delete_session("broken-delete")
-    assert delete_info.value is delete_error
-
-
-def test_context_resolution_is_once_per_operation_and_concurrency_safe() -> None:
-    resolved = 0
-
-    def resolver(config: dict[str, Any]) -> str:
-        nonlocal resolved
-        resolved += 1
-        return config["configurable"]["thread_id"]
-
-    contexts: list[SessionLifecycleContext] = []
-    backend = make_backend(
-        session_resolver=resolver,
-        before_session_acquire=contexts.append,
-    )
-    backend._active_config = lambda: {"configurable": {"thread_id": "active"}}
-
-    backend.get_session_claim_name()
-    assert resolved == 1
-    backend.get_session_claim_name()
-    assert resolved == 2
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        list(
-            executor.map(
-                backend.get_session_claim_name,
-                [f"session-{index}" for index in range(16)],
-            )
-        )
-
-    observed = {context.raw_session_id for context in contexts}
-    assert observed == {"active", *(f"session-{index}" for index in range(16))}
-    assert all(
-        context.claim_name == f"session-{context.opaque_session_id}"
-        for context in contexts
-    )
-
-
-def test_created_hook_failure_deletes_new_claim() -> None:
-    client = SessionStubClient()
-
-    def fail(opaque: str, backend: AgentSandboxBackend) -> None:
-        del opaque, backend
-        raise RuntimeError("restore failed")
-
-    backend = make_backend(client, on_session_created=fail)
-    with pytest.raises(RuntimeError, match="restore failed"):
-        backend.get_session_claim_name("broken")
-    assert len(client.deleted) == 1
-
-
-def test_delete_uncached_session_passes_none_to_hook() -> None:
-    client = SessionStubClient()
-    observed: list[AgentSandboxBackend | None] = []
-    backend = make_backend(
-        client,
-        before_session_deleted=lambda opaque, value: observed.append(value),
-    )
-    expected = backend._claim_name(backend.opaque_session_id("uncached"))
-    backend.delete_session("uncached")
-    assert observed == [None]
-    assert client.deleted == [(expected, "default")]
-
-
-def test_endpoint_access_and_ipv6_url() -> None:
+def test_direct_composite_and_middleware_integration() -> None:
     backend = make_backend()
-    service = backend.get_session_endpoint(5901, session_id="desktop")
-    assert isinstance(service, SessionSandboxEndpoint)
-    assert service.host.endswith(".svc.cluster.local")
-    assert service.url.endswith(":5901")
-
-    pod = backend.get_session_endpoint(9222, prefer_pod_ip=True, session_id="desktop")
-    assert pod.host == "10.0.0.8"
-    ipv6 = SessionSandboxEndpoint("2001:db8::1", 9222, "c", "s", "ns")
-    assert ipv6.url == "http://[2001:db8::1]:9222"
+    assert isinstance(backend, SandboxBackendProtocol)
+    composite = CompositeBackend(default=backend, routes={})
+    assert composite.default is backend
+    assert FilesystemMiddleware(backend=backend)
+    assert SkillsMiddleware(backend=backend, sources=[])
 
 
 @pytest.mark.asyncio
 async def test_sync_and_async_deepagents_delegation() -> None:
     backend = make_backend()
-    opaque, entry = backend._entry("delegation")
-    del opaque
+    pinned(backend, "delegation")
+    entry = backend._entry(config_for("delegation"))
+
     concrete = MagicMock(spec=AgentSandboxBackend)
     concrete.execute.return_value = result("ok")
     concrete.ls.return_value = SimpleNamespace(entries=[], error=None)
@@ -594,12 +518,12 @@ async def test_sync_and_async_deepagents_delegation() -> None:
     concrete.glob.return_value = SimpleNamespace(matches=[], error=None)
     concrete.upload_files.return_value = []
     concrete.download_files.return_value = []
-    backend._entries[backend.opaque_session_id("delegation")] = _SessionEntry(
+    backend._entries["delegation"] = _SessionEntry(
         backend=concrete,
-        sandbox=entry.sandbox,
-        claim_name=entry.claim_name,
+        lease=entry.lease,
+        last_accessed_at=entry.last_accessed_at,
+        last_touched_at=entry.last_touched_at,
     )
-    backend._active_config = lambda: {"configurable": {"thread_id": "delegation"}}
 
     backend.execute("pwd")
     backend.ls("/")
@@ -629,18 +553,9 @@ async def test_sync_and_async_deepagents_delegation() -> None:
     assert concrete.grep.call_args_list[1].kwargs == {"max_count": 3}
 
 
-def test_direct_composite_and_middleware_integration() -> None:
-    backend = make_backend()
-    assert isinstance(backend, SandboxBackendProtocol)
-    composite = CompositeBackend(default=backend, routes={})
-    assert composite.default is backend
-    assert FilesystemMiddleware(backend=backend)
-    assert SkillsMiddleware(backend=backend, sources=[])
-
-
 def test_current_deepagents_graph_invocation_uses_session_backend() -> None:
-    client = SessionStubClient()
-    backend = make_backend(client)
+    provider = RecordingProvider()
+    backend = make_backend(provider)
     graph = create_deep_agent(
         model=ToolCallingFakeModel(
             responses=[
@@ -666,7 +581,6 @@ def test_current_deepagents_graph_invocation_uses_session_backend() -> None:
     )
 
     assert result_state["messages"][-1].content == "done"
-    claim = backend.get_session_claim_name("deepagents-current")
-    assert client.sandboxes[claim].files.write_calls == [
+    assert provider.sandboxes["deepagents-current"].files.write_calls == [
         ("deepagents.txt", b"ok"),
     ]

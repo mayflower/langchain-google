@@ -12,22 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Durable, session-aware DeepAgents backend for agent-sandbox."""
+"""Session-aware DeepAgents backend over a product-owned lease provider."""
 
 from __future__ import annotations
 
 import asyncio
 import atexit
-import base64
-import hashlib
-import hmac
-import ipaddress
 import logging
 import threading
 import time
+import warnings
 import weakref
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from deepagents.backends.protocol import (
@@ -45,71 +42,37 @@ from deepagents.backends.protocol import (
 )
 from k8s_agent_sandbox.exceptions import SandboxNotFoundError
 
-from langchain_google_agent_sandbox import _compat
-from langchain_google_agent_sandbox._compat import SESSION_LABEL_KEY
 from langchain_google_agent_sandbox.backend import AgentSandboxBackend
+from langchain_google_agent_sandbox.limits import SandboxResultLimits
+from langchain_google_agent_sandbox.provider import SandboxLease, SandboxSessionProvider
 
 SessionResolver = Callable[[Mapping[str, Any]], str]
-SessionHook = Callable[[str, AgentSandboxBackend], None]
-BeforeDeleteHook = Callable[[str, AgentSandboxBackend | None], None]
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True)
-class SessionLifecycleContext:
-    """Immutable identity and routing data for one session operation."""
-
-    raw_session_id: str
-    opaque_session_id: str
-    claim_name: str
-    namespace: str
-    warm_pool: str
-
-
-BeforeSessionAcquireHook = Callable[[SessionLifecycleContext], None]
-AfterSessionAcquireHook = Callable[
-    [SessionLifecycleContext, AgentSandboxBackend, bool], None
+__all__ = [
+    "ProviderSessionAgentSandboxBackend",
+    "SessionAgentSandboxBackend",
+    "default_session_resolver",
 ]
-SessionAcquireErrorHook = Callable[[SessionLifecycleContext, Exception], None]
-SessionAccessedHook = Callable[[SessionLifecycleContext], None]
-AfterSessionDeletedHook = Callable[[SessionLifecycleContext], None]
-SessionDeleteErrorHook = Callable[[SessionLifecycleContext, Exception], None]
-
-
-@dataclass(frozen=True)
-class SessionSandboxEndpoint:
-    """Connection metadata for one session sandbox endpoint."""
-
-    host: str
-    port: int
-    claim_name: str
-    sandbox_id: str
-    namespace: str
-
-    @property
-    def url(self) -> str:
-        """Return an HTTP URL, bracketing IPv6 hosts per RFC 3986."""
-        host = self.host
-        try:
-            if ipaddress.ip_address(host).version == 6:
-                host = f"[{host}]"
-        except ValueError:
-            pass
-        return f"http://{host}:{self.port}"
-
-
-@dataclass
-class _SessionEntry:
-    backend: AgentSandboxBackend
-    sandbox: Any
-    claim_name: str
-    last_renewed_at: float | None = None
-    last_accessed_at: float = field(default_factory=time.monotonic)
 
 
 def default_session_resolver(config: Mapping[str, Any]) -> str:
-    """Resolve ``configurable.thread_id`` from the active LangGraph config."""
+    """Resolve ``configurable.thread_id`` from the active LangGraph config.
+
+    This is a pure local read used only to look up a process-local cache entry.
+    It derives no Kubernetes identity: the mapping from session to durable
+    infrastructure belongs entirely to the provider.
+
+    Args:
+        config: The active LangGraph config mapping.
+
+    Returns:
+        The thread identifier used as this process's cache key.
+
+    Raises:
+        RuntimeError: If the config carries no usable ``thread_id``.
+    """
     configurable = config.get("configurable", {})
     if not isinstance(configurable, Mapping):
         msg = "LangGraph configurable must be a mapping"
@@ -121,75 +84,48 @@ def default_session_resolver(config: Mapping[str, Any]) -> str:
     return thread_id
 
 
-class SessionAgentSandboxBackend(SandboxBackendProtocol):
-    """Long-lived DeepAgents backend multiplexed by opaque session identity.
+@dataclass
+class _SessionEntry:
+    """One process-local cached session."""
 
-    The adapter derives a deterministic Claim name from the active LangGraph
-    session, acquires it through the SDK's atomic get-or-create operation, and
-    caches one concrete :class:`AgentSandboxBackend` per opaque session in the
-    current process. Closing this adapter never deletes Claims.
+    backend: AgentSandboxBackend
+    lease: SandboxLease
+    last_accessed_at: float
+    last_touched_at: float
+
+
+class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
+    """DeepAgents backend multiplexed over provider-supplied sandbox leases.
+
+    The adapter owns exactly five things: protocol translation, path
+    normalization, a process-local lease cache, reattachment after a stale
+    local handle, and local connector shutdown.
+
+    It owns no durable lifecycle. It never creates, renames, labels, renews,
+    lists, or deletes a Kubernetes Claim, never derives a Claim name, and never
+    hashes product identity. Every acquisition goes through
+    :meth:`SandboxSessionProvider.acquire`, which is free to reject it.
+
+    Closing this backend, or evicting a cached session, releases only local
+    client resources. Remote infrastructure is untouched.
     """
-
-    SESSION_LABEL_KEY = SESSION_LABEL_KEY
 
     def __init__(
         self,
-        client: Any,
-        warm_pool: str,
-        session_secret: str | bytes,
+        provider: SandboxSessionProvider,
         *,
-        namespace: str = "default",
         session_resolver: SessionResolver | None = None,
         root_dir: str = "/workspace",
         runtime_root: str = "/workspace",
         allow_absolute_paths: bool = False,
-        sandbox_ready_timeout: int = 180,
-        labels: dict[str, str] | None = None,
-        idle_ttl_seconds: int | None = None,
-        renewal_threshold_seconds: int | None = None,
         default_timeout_seconds: int | None = 120,
         local_cache_ttl_seconds: int | None = 300,
         max_cached_sessions: int = 128,
-        legacy_label_fallback: bool = False,
-        on_session_created: SessionHook | None = None,
-        on_session_attached: SessionHook | None = None,
-        before_session_deleted: BeforeDeleteHook | None = None,
-        before_session_acquire: BeforeSessionAcquireHook | None = None,
-        after_session_acquire: AfterSessionAcquireHook | None = None,
-        on_session_acquire_error: SessionAcquireErrorHook | None = None,
-        on_session_accessed: SessionAccessedHook | None = None,
-        after_session_deleted: AfterSessionDeletedHook | None = None,
-        on_session_delete_error: SessionDeleteErrorHook | None = None,
+        touch_interval_seconds: float = 60.0,
+        limits: SandboxResultLimits | None = None,
     ) -> None:
-        if not warm_pool:
-            msg = "warm_pool cannot be empty"
-            raise ValueError(msg)
-        secret = (
-            session_secret.encode("utf-8")
-            if isinstance(session_secret, str)
-            else session_secret
-        )
-        if not isinstance(secret, bytes) or not secret:
-            msg = "session_secret must be non-empty bytes or text"
-            raise ValueError(msg)
-        if idle_ttl_seconds is not None:
-            if type(idle_ttl_seconds) is not int or idle_ttl_seconds <= 0:
-                msg = "idle_ttl_seconds must be a positive integer"
-                raise ValueError(msg)
-            if renewal_threshold_seconds is None:
-                renewal_threshold_seconds = max(1, idle_ttl_seconds // 4)
-            if (
-                type(renewal_threshold_seconds) is not int
-                or renewal_threshold_seconds <= 0
-                or renewal_threshold_seconds >= idle_ttl_seconds
-            ):
-                msg = (
-                    "renewal_threshold_seconds must be positive and smaller "
-                    "than idle_ttl_seconds"
-                )
-                raise ValueError(msg)
-        elif renewal_threshold_seconds is not None:
-            msg = "renewal_threshold_seconds requires idle_ttl_seconds"
+        if provider is None:
+            msg = "provider is required; see SandboxSessionProvider"
             raise ValueError(msg)
         if local_cache_ttl_seconds is not None and (
             type(local_cache_ttl_seconds) is not int or local_cache_ttl_seconds <= 0
@@ -199,36 +135,27 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         if type(max_cached_sessions) is not int or max_cached_sessions <= 0:
             msg = "max_cached_sessions must be a positive integer"
             raise ValueError(msg)
-        if labels and self.SESSION_LABEL_KEY in labels:
-            msg = f"labels must not override {self.SESSION_LABEL_KEY}"
+        if (
+            isinstance(touch_interval_seconds, bool)
+            or not isinstance(touch_interval_seconds, (int, float))
+            or touch_interval_seconds < 0
+        ):
+            msg = "touch_interval_seconds must be a non-negative number"
             raise ValueError(msg)
 
-        self._client = client
-        self._warm_pool = warm_pool
-        self._secret = secret
-        self._namespace = namespace
+        self._provider = provider
         self._session_resolver = session_resolver or default_session_resolver
         self._root_dir = root_dir
         self._runtime_root = runtime_root
         self._allow_absolute_paths = allow_absolute_paths
-        self._sandbox_ready_timeout = sandbox_ready_timeout
-        self._labels = dict(labels or {})
-        self._idle_ttl_seconds = idle_ttl_seconds
-        self._renewal_threshold_seconds = renewal_threshold_seconds
         self._default_timeout_seconds = default_timeout_seconds
         self._local_cache_ttl_seconds = local_cache_ttl_seconds
         self._max_cached_sessions = max_cached_sessions
-        self._legacy_label_fallback = legacy_label_fallback
-        self._on_session_created = on_session_created
-        self._on_session_attached = on_session_attached
-        self._before_session_deleted = before_session_deleted
-        self._before_session_acquire = before_session_acquire
-        self._after_session_acquire = after_session_acquire
-        self._on_session_acquire_error = on_session_acquire_error
-        self._on_session_accessed = on_session_accessed
-        self._after_session_deleted = after_session_deleted
-        self._on_session_delete_error = on_session_delete_error
+        self._touch_interval_seconds = float(touch_interval_seconds)
+        self._limits = limits
         self._entries: dict[str, _SessionEntry] = {}
+        # Reverse index enforcing that one lease never backs two session keys.
+        self._lease_owners: dict[str, str] = {}
         self._session_locks: weakref.WeakValueDictionary[str, threading.RLock] = (
             weakref.WeakValueDictionary()
         )
@@ -246,70 +173,20 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
             msg = "No active LangGraph config is available for sandbox resolution"
             raise RuntimeError(msg) from error
 
-    def opaque_session_id(self, session_id: str | None = None) -> str:
-        """Return the stable opaque identifier for an explicit or active session."""
-        return self._resolve_context(session_id).opaque_session_id
-
-    def _resolve_context(
-        self, session_id: str | None = None
-    ) -> SessionLifecycleContext:
-        """Resolve all immutable session data exactly once for an operation."""
-        raw_identity = session_id
-        if raw_identity is None:
-            raw_identity = self._session_resolver(self._active_config())
-        if not isinstance(raw_identity, str) or not raw_identity:
+    def _resolve(
+        self, config: Mapping[str, Any] | None = None
+    ) -> tuple[str, Mapping[str, Any]]:
+        """Return the cache key and the config that produced it."""
+        resolved = self._active_config() if config is None else config
+        key = self._session_resolver(resolved)
+        if not isinstance(key, str) or not key:
             msg = "session resolver must return non-empty text"
             raise RuntimeError(msg)
-        digest = hmac.new(
-            self._secret,
-            raw_identity.encode("utf-8"),
-            hashlib.sha256,
-        ).digest()
-        opaque_session_id = base64.b32encode(digest).decode("ascii").rstrip("=").lower()
-        return SessionLifecycleContext(
-            raw_session_id=raw_identity,
-            opaque_session_id=opaque_session_id,
-            claim_name=self._claim_name(opaque_session_id),
-            namespace=self._namespace,
-            warm_pool=self._warm_pool,
-        )
+        return key, resolved
 
-    @staticmethod
-    def _claim_name(opaque_session_id: str) -> str:
-        return f"session-{opaque_session_id}"
-
-    def _lock_for(self, opaque_session_id: str) -> threading.RLock:
+    def _lock_for(self, session_key: str) -> threading.RLock:
         with self._cache_lock:
-            return self._session_locks.setdefault(opaque_session_id, threading.RLock())
-
-    def _legacy_claim(self, opaque_session_id: str, claim_name: str) -> str | None:
-        if not self._legacy_label_fallback:
-            return None
-        selector = f"{self.SESSION_LABEL_KEY}={opaque_session_id}"
-        matches = _compat.list_sandbox_claims(
-            self._client,
-            namespace=self._namespace,
-            label_selector=selector,
-        )
-        if len(matches) > 1:
-            msg = (
-                "Refusing session acquisition because multiple Claims match "
-                f"opaque session {opaque_session_id!r}"
-            )
-            raise RuntimeError(msg)
-        if matches and matches[0] != claim_name:
-            try:
-                self._client.get_sandbox_claim_warmpool_name(
-                    claim_name, self._namespace
-                )
-            except SandboxNotFoundError:
-                return matches[0]
-            msg = (
-                "Refusing session acquisition because both deterministic and "
-                f"legacy Claims exist for opaque session {opaque_session_id!r}"
-            )
-            raise RuntimeError(msg)
-        return None
+            return self._session_locks.setdefault(session_key, threading.RLock())
 
     def _wrap(self, sandbox: Any) -> AgentSandboxBackend:
         return AgentSandboxBackend.from_existing(
@@ -318,117 +195,63 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
             allow_absolute_paths=self._allow_absolute_paths,
             runtime_root=self._runtime_root,
             default_timeout_seconds=self._default_timeout_seconds,
+            limits=self._limits,
         )
 
-    @staticmethod
-    def _notify_error(
-        callback: SessionAcquireErrorHook | SessionDeleteErrorHook | None,
-        context: SessionLifecycleContext,
-        error: Exception,
-        *,
-        operation: str,
-    ) -> None:
-        if callback is None:
-            return
-        try:
-            callback(context, error)
-        except Exception:
-            logger.exception(
-                "Session %s error callback failed for opaque session %s",
-                operation,
-                context.opaque_session_id,
-            )
+    def _acquire(self, session_key: str, config: Mapping[str, Any]) -> _SessionEntry:
+        """Obtain a lease from the provider and wrap it for DeepAgents use.
 
-    def _acquire(self, context: SessionLifecycleContext) -> _SessionEntry:
-        created = False
-        backend: AgentSandboxBackend | None = None
-        claim_name = context.claim_name
-        try:
-            if self._before_session_acquire is not None:
-                self._before_session_acquire(context)
-            legacy_claim = self._legacy_claim(context.opaque_session_id, claim_name)
-            if legacy_claim is not None:
-                sandbox = _compat.get_sandbox(
-                    self._client,
-                    claim_name=legacy_claim,
-                    namespace=context.namespace,
-                    warm_pool=context.warm_pool,
-                )
-                claim_name = legacy_claim
-            else:
-                labels = dict(self._labels)
-                acquisition = self._client.get_or_create_sandbox(
-                    warmpool=context.warm_pool,
-                    namespace=context.namespace,
-                    sandbox_ready_timeout=self._sandbox_ready_timeout,
-                    labels=labels or None,
-                    claim_name=claim_name,
-                    required_labels={self.SESSION_LABEL_KEY: context.opaque_session_id},
-                    shutdown_after_seconds=self._idle_ttl_seconds,
-                )
-                sandbox = acquisition.sandbox
-                created = acquisition.created
-
-            backend = self._wrap(sandbox)
-            entry = _SessionEntry(
-                backend=backend,
-                sandbox=sandbox,
-                claim_name=claim_name,
-                last_accessed_at=time.monotonic(),
+        Provider errors propagate unchanged: admission refusals, capacity
+        errors, and terminal claim failures are the product's to describe, and
+        wrapping them would hide the reason from the caller.
+        """
+        lease = self._provider.acquire(config)
+        if not isinstance(lease, SandboxLease):
+            msg = (
+                "provider.acquire must return a SandboxLease, got "
+                f"{type(lease).__name__}"
             )
-            self._renew(entry, force=True)
-            if created:
-                if self._on_session_created is not None:
-                    self._on_session_created(context.opaque_session_id, backend)
-            elif self._on_session_attached is not None:
-                self._on_session_attached(context.opaque_session_id, backend)
-            if self._after_session_acquire is not None:
-                self._after_session_acquire(context, backend, created)
-            return entry
-        except Exception as error:
-            if created:
-                try:
-                    _compat.delete_sandbox(
-                        self._client,
-                        claim_name=claim_name,
-                        namespace=context.namespace,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to clean up newly created Claim %s",
-                        claim_name,
-                    )
-            if backend is not None:
-                backend.close()
-            self._notify_error(
-                self._on_session_acquire_error,
-                context,
-                error,
-                operation="acquire",
+            raise TypeError(msg)
+        owner = self._lease_owners.get(lease.key)
+        if owner is not None and owner != session_key:
+            # Two sessions sharing one sandbox would cross-contaminate agent
+            # filesystems, so refuse rather than serve the wrong workspace.
+            msg = (
+                f"provider returned lease {lease.key!r} for session "
+                f"{session_key!r}, but it is already held by session {owner!r}"
             )
-            raise
-
-    def _renew(self, entry: _SessionEntry, *, force: bool = False) -> None:
-        if self._idle_ttl_seconds is None:
-            return
-        now = time.monotonic()
-        threshold = self._renewal_threshold_seconds
-        if threshold is None:
-            msg = "renewal threshold is not initialized"
             raise RuntimeError(msg)
-        renewal_interval = self._idle_ttl_seconds - threshold
-        if (
-            not force
-            and entry.last_renewed_at is not None
-            and now - entry.last_renewed_at < renewal_interval
-        ):
-            return
-        self._client.renew_sandbox(
-            entry.claim_name,
-            self._namespace,
-            self._idle_ttl_seconds,
+        now = time.monotonic()
+        return _SessionEntry(
+            backend=self._wrap(lease.sandbox),
+            lease=lease,
+            last_accessed_at=now,
+            last_touched_at=now,
         )
-        entry.last_renewed_at = now
+
+    def _touch(self, entry: _SessionEntry, now: float) -> None:
+        """Report activity at most once per configured interval."""
+        if now - entry.last_touched_at < self._touch_interval_seconds:
+            return
+        entry.last_touched_at = now
+        try:
+            self._provider.touch(entry.lease)
+        except Exception:
+            # touch() is advisory. A control plane hiccup must not fail the
+            # agent's file operation; the provider sees its own error.
+            logger.exception("provider.touch failed for lease %s", entry.lease.key)
+
+    def _release(self, entry: _SessionEntry) -> None:
+        """Release local resources for one entry. Never touches remote state."""
+        try:
+            entry.backend.close()
+        finally:
+            try:
+                self._provider.close_local(entry.lease)
+            except Exception:
+                logger.exception(
+                    "provider.close_local failed for lease %s", entry.lease.key
+                )
 
     def _evict_idle_entries(self, *, exclude: str | None = None) -> None:
         ttl = self._local_cache_ttl_seconds
@@ -436,190 +259,122 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
             entries = list(self._entries.items())
         cutoff = time.monotonic() - ttl if ttl is not None else None
         candidates = {
-            opaque_session_id
-            for opaque_session_id, entry in entries
-            if opaque_session_id != exclude
+            session_key
+            for session_key, entry in entries
+            if session_key != exclude
             and cutoff is not None
             and entry.last_accessed_at <= cutoff
         }
-        current_is_cached = any(
-            opaque_session_id == exclude for opaque_session_id, _ in entries
-        )
+        current_is_cached = any(session_key == exclude for session_key, _ in entries)
         projected_size = len(entries) + (0 if current_is_cached else 1)
         overflow = max(0, projected_size - self._max_cached_sessions)
         capacity_candidates: set[str] = set()
         if overflow:
             oldest = sorted(
-                (
-                    (entry.last_accessed_at, opaque_session_id)
-                    for opaque_session_id, entry in entries
-                    if opaque_session_id != exclude
-                    and opaque_session_id not in candidates
-                ),
+                (entry.last_accessed_at, session_key)
+                for session_key, entry in entries
+                if session_key != exclude and session_key not in candidates
             )
-            capacity_candidates = {
-                opaque_session_id for _, opaque_session_id in oldest[:overflow]
-            }
+            capacity_candidates = {session_key for _, session_key in oldest[:overflow]}
             candidates.update(capacity_candidates)
-        for opaque_session_id in candidates:
-            with self._lock_for(opaque_session_id):
+        for session_key in candidates:
+            with self._lock_for(session_key):
                 with self._cache_lock:
-                    entry = self._entries.get(opaque_session_id)
+                    entry = self._entries.get(session_key)
                     if entry is None:
                         continue
                     if (
                         cutoff is not None
-                        and opaque_session_id not in capacity_candidates
+                        and session_key not in capacity_candidates
                         and entry.last_accessed_at > cutoff
                     ):
                         continue
-                    self._entries.pop(opaque_session_id, None)
-                entry.backend.close()
+                    self._entries.pop(session_key, None)
+                    self._lease_owners.pop(entry.lease.key, None)
+                self._release(entry)
 
-    def _entry_locked(self, context: SessionLifecycleContext) -> _SessionEntry:
+    def _entry_locked(
+        self, session_key: str, config: Mapping[str, Any]
+    ) -> _SessionEntry:
         if self._closed:
-            msg = "SessionAgentSandboxBackend is closed"
+            msg = "ProviderSessionAgentSandboxBackend is closed"
             raise RuntimeError(msg)
         with self._cache_lock:
-            entry = self._entries.get(context.opaque_session_id)
+            entry = self._entries.get(session_key)
         if entry is not None:
-            try:
-                self._renew(entry)
-                entry.last_accessed_at = time.monotonic()
-                if self._on_session_accessed is not None:
-                    self._on_session_accessed(context)
-                return entry
-            except SandboxNotFoundError:
-                entry.backend.close()
-                with self._cache_lock:
-                    self._entries.pop(context.opaque_session_id, None)
-        entry = self._acquire(context)
-        entry.last_accessed_at = time.monotonic()
+            now = time.monotonic()
+            entry.last_accessed_at = now
+            self._touch(entry, now)
+            return entry
+        entry = self._acquire(session_key, config)
         with self._cache_lock:
-            self._entries[context.opaque_session_id] = entry
-        if self._on_session_accessed is not None:
-            self._on_session_accessed(context)
+            self._entries[session_key] = entry
+            self._lease_owners[entry.lease.key] = session_key
         return entry
 
-    def _entry(self, session_id: str | None = None) -> tuple[str, _SessionEntry]:
-        context = self._resolve_context(session_id)
-        self._evict_idle_entries(exclude=context.opaque_session_id)
-        with self._lock_for(context.opaque_session_id):
-            entry = self._entry_locked(context)
-            return context.opaque_session_id, entry
+    def _invalidate(self, session_key: str) -> None:
+        with self._cache_lock:
+            entry = self._entries.pop(session_key, None)
+            if entry is not None:
+                self._lease_owners.pop(entry.lease.key, None)
+        if entry is not None:
+            self._release(entry)
 
-    def _invoke(
-        self,
-        method_name: str,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        context = self._resolve_context()
-        self._evict_idle_entries(exclude=context.opaque_session_id)
-        with self._lock_for(context.opaque_session_id):
-            entry = self._entry_locked(context)
+    def _entry(self, config: Mapping[str, Any] | None = None) -> _SessionEntry:
+        session_key, resolved = self._resolve(config)
+        self._evict_idle_entries(exclude=session_key)
+        with self._lock_for(session_key):
+            return self._entry_locked(session_key, resolved)
+
+    def _invoke(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        session_key, config = self._resolve()
+        self._evict_idle_entries(exclude=session_key)
+        with self._lock_for(session_key):
+            entry = self._entry_locked(session_key, config)
             try:
                 return getattr(entry.backend, method_name)(*args, **kwargs)
             except SandboxNotFoundError:
-                self._invalidate(context.opaque_session_id)
-                replacement = self._entry_locked(context)
+                # The sandbox vanished under a cached handle. Drop it and
+                # re-acquire exactly once. A second failure is genuine and
+                # propagates rather than starting a retry loop.
+                #
+                # This catch is deliberately narrow. Sibling SDK errors --
+                # notably SandboxClaimFailedError, which reports a terminal
+                # Ready=False reason the controller will not retry -- must
+                # propagate untouched instead of driving a pointless re-acquire.
+                self._invalidate(session_key)
+                replacement = self._entry_locked(session_key, config)
                 return getattr(replacement.backend, method_name)(*args, **kwargs)
 
-    def _invalidate(self, opaque_session_id: str) -> None:
-        with self._cache_lock:
-            entry = self._entries.pop(opaque_session_id, None)
-        if entry is not None:
-            entry.backend.close()
+    def get_session_lease(
+        self, config: Mapping[str, Any] | None = None
+    ) -> SandboxLease:
+        """Return the provider lease backing an explicit or active session."""
+        return self._entry(config).lease
 
-    def close_session(self, session_id: str) -> None:
-        """Close local connectors for one session without deleting its Claim."""
-        context = self._resolve_context(session_id)
-        with self._lock_for(context.opaque_session_id):
-            self._invalidate(context.opaque_session_id)
-
-    def delete_session(self, session_id: str) -> None:
-        """Run the delete hook and explicitly delete one session Claim."""
-        context = self._resolve_context(session_id)
-        claim_name = context.claim_name
-        with self._lock_for(context.opaque_session_id):
-            try:
-                with self._cache_lock:
-                    entry = self._entries.get(context.opaque_session_id)
-                if self._before_session_deleted is not None:
-                    self._before_session_deleted(
-                        context.opaque_session_id,
-                        entry.backend if entry is not None else None,
-                    )
-                if entry is not None:
-                    claim_name = entry.claim_name
-                else:
-                    legacy = self._legacy_claim(context.opaque_session_id, claim_name)
-                    if legacy is not None:
-                        claim_name = legacy
-                _compat.delete_sandbox(
-                    self._client,
-                    claim_name=claim_name,
-                    namespace=context.namespace,
-                )
-                self._invalidate(context.opaque_session_id)
-                if self._after_session_deleted is not None:
-                    self._after_session_deleted(context)
-            except Exception as error:
-                self._notify_error(
-                    self._on_session_delete_error,
-                    context,
-                    error,
-                    operation="delete",
-                )
-                raise
+    def close_session(self, config: Mapping[str, Any] | None = None) -> None:
+        """Release local resources for one session without deleting anything."""
+        session_key, _ = self._resolve(config)
+        with self._lock_for(session_key):
+            self._invalidate(session_key)
 
     def close(self) -> None:
-        """Close every local connector without deleting Kubernetes Claims."""
+        """Release every local connector. Remote Claims are left running."""
         with self._cache_lock:
             if self._closed:
                 return
             self._closed = True
             entries = list(self._entries.values())
             self._entries.clear()
+            self._lease_owners.clear()
         atexit.unregister(self.close)
         for entry in entries:
-            entry.backend.close()
-
-    def get_session_sandbox(self, session_id: str | None = None) -> Any:
-        """Return the SDK Sandbox handle for an explicit or active session."""
-        return self._entry(session_id)[1].sandbox
-
-    def get_session_claim_name(self, session_id: str | None = None) -> str:
-        """Return the acquired Claim name for an explicit or active session."""
-        return self._entry(session_id)[1].claim_name
-
-    def get_session_endpoint(
-        self,
-        port: int,
-        prefer_pod_ip: bool = False,
-        *,
-        session_id: str | None = None,
-    ) -> SessionSandboxEndpoint:
-        """Return service or current Pod endpoint metadata for a session."""
-        if type(port) is not int or not 1 <= port <= 65535:
-            msg = "port must be an integer between 1 and 65535"
-            raise ValueError(msg)
-        entry = self._entry(session_id)[1]
-        host = entry.sandbox.service_host
-        if prefer_pod_ip:
-            host = entry.sandbox.get_pod_ip() or host
-        return SessionSandboxEndpoint(
-            host=host,
-            port=port,
-            claim_name=entry.claim_name,
-            sandbox_id=entry.sandbox.sandbox_id,
-            namespace=entry.sandbox.namespace,
-        )
+            self._release(entry)
 
     @property
     def id(self) -> str:
-        """Return the current session's namespace and Claim name."""
-        return f"{self._namespace}/{self.get_session_claim_name()}"
+        """Return a stable, opaque identifier for the active session."""
+        return f"agent-sandbox/{self._entry().lease.key}"
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         return self._invoke("execute", command, timeout=timeout)
@@ -643,7 +398,7 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
         return self._invoke("edit", file_path, old_string, new_string, replace_all)
 
     def delete(self, file_path: str) -> DeleteResult:
-        """Recursively delete a path from the current session sandbox."""
+        """Recursively delete a path inside the current session sandbox."""
         return self._invoke("delete", file_path)
 
     async def adelete(self, file_path: str) -> DeleteResult:
@@ -670,3 +425,60 @@ class SessionAgentSandboxBackend(SandboxBackendProtocol):
 
     def download_files(self, paths: Iterable[str]) -> list[FileDownloadResponse]:
         return self._invoke("download_files", paths)
+
+
+#: Arguments the pre-provider backend accepted, mapped to their replacement.
+#: These are rejected loudly rather than absorbed by ``**kwargs``, because
+#: silently ignoring, say, ``session_secret`` would leave a caller believing
+#: identity is still being derived here.
+_REMOVED_ARGUMENTS = {
+    "client": "supply a product SandboxSessionProvider via provider=",
+    "warm_pool": "provider/control-plane configuration",
+    "session_secret": "provider-owned identity mapping",
+    "namespace": "provider/control-plane configuration",
+    "sandbox_ready_timeout": "provider/control-plane configuration",
+    "labels": "provider/control-plane configuration",
+    "idle_ttl_seconds": "provider-owned lease lifetime",
+    "renewal_threshold_seconds": "provider-owned lease renewal",
+    "legacy_label_fallback": "removed; the provider owns session discovery",
+    "on_session_created": "provider workspace preparation/eventing",
+    "on_session_attached": "provider workspace preparation/eventing",
+    "before_session_deleted": "product control-plane close operation",
+    "before_session_acquire": "provider admission",
+    "after_session_acquire": "provider workspace preparation/eventing",
+    "on_session_acquire_error": "provider error handling",
+    "on_session_accessed": "throttled provider touch()",
+    "after_session_deleted": "product control-plane close operation",
+    "on_session_delete_error": "product control-plane close operation",
+}
+
+
+class SessionAgentSandboxBackend(ProviderSessionAgentSandboxBackend):
+    """Deprecated alias for :class:`ProviderSessionAgentSandboxBackend`.
+
+    !!! warning "Removed in a future release"
+        This name exists only to give one coordinated migration commit a
+        landing place. It does **not** preserve the old lifecycle behavior:
+        this backend can no longer create, renew, discover, or delete Claims,
+        and it no longer derives Claim names from session identity.
+    """
+
+    def __init__(self, provider: SandboxSessionProvider, **kwargs: Any) -> None:
+        removed = sorted(set(kwargs) & set(_REMOVED_ARGUMENTS))
+        if removed:
+            details = "; ".join(
+                f"{name} -> {_REMOVED_ARGUMENTS[name]}" for name in removed
+            )
+            msg = (
+                "SessionAgentSandboxBackend no longer owns session lifecycle, so "
+                f"these arguments have no effect and were rejected: {details}. "
+                "See docs/adr/0001-provider-owned-session-lifecycle.md."
+            )
+            raise TypeError(msg)
+        warnings.warn(
+            "SessionAgentSandboxBackend is deprecated; use "
+            "ProviderSessionAgentSandboxBackend",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(provider, **kwargs)

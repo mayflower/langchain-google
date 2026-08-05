@@ -14,9 +14,8 @@ from langchain_google_agent_sandbox.provider import (
     SandboxSessionProvider,
 )
 from langchain_google_agent_sandbox.session_backend import (
+    ProviderSessionAgentSandboxBackend,
     SessionAgentSandboxBackend,
-    SessionLifecycleContext,
-    SessionSandboxEndpoint,
     default_session_resolver,
 )
 
@@ -27,13 +26,12 @@ except metadata.PackageNotFoundError:
 
 __all__ = [
     "AgentSandboxBackend",
+    "ProviderSessionAgentSandboxBackend",
     "SandboxLease",
     "SandboxPolicyWrapper",
     "SandboxResultLimits",
     "SandboxSessionProvider",
     "SessionAgentSandboxBackend",
-    "SessionLifecycleContext",
-    "SessionSandboxEndpoint",
     "__version__",
     "create_sandbox_backend",
     "create_sandbox_backend_factory",
