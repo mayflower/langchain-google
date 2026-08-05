@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 import threading
 import time
+import weakref
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -426,7 +428,105 @@ def test_lease_key_is_passed_through_not_derived() -> None:
     backend = make_backend()
     pinned(backend, "t1")
     assert backend.get_session_lease(config_for("t1")).key == "lease-t1"
-    assert backend.id == "agent-sandbox/lease-t1"
+
+
+def test_id_is_stable_and_never_provisions_a_sandbox() -> None:
+    """`id` names the backend instance, so reading it must not call acquire."""
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    pinned(backend, "t1")
+
+    first = backend.id
+    assert backend.id == first  # stable across reads
+    assert provider.acquire_calls == []  # and free of side effects
+
+    backend._entry(config_for("t1"))
+    # Acquiring a session must not change the instance identifier.
+    assert backend.id == first
+    assert make_backend(RecordingProvider()).id != first
+
+
+def test_concurrent_sessions_cannot_share_one_lease() -> None:
+    """Regression: the ownership check must be atomic with publication.
+
+    Two session keys hold different per-session locks. A check performed
+    outside the cache lock passed for both threads before either published,
+    leaving two agents on one sandbox filesystem.
+    """
+    barrier = threading.Barrier(2)
+
+    class CollidingProvider(RecordingProvider):
+        def acquire(self, config: Mapping[str, Any]) -> SandboxLease:
+            super().acquire(config)
+            return SandboxLease(
+                key="SHARED", sandbox=self.sandboxes.setdefault("shared", StubSandbox())
+            )
+
+    provider = CollidingProvider()
+    backend = make_backend(provider)
+
+    original_wrap = backend._wrap
+
+    def wrap_in_the_race_window(sandbox: Any) -> Any:
+        # Park both threads after the ownership check, before publication.
+        barrier.wait(timeout=5)
+        return original_wrap(sandbox)
+
+    backend._wrap = wrap_in_the_race_window  # type: ignore[method-assign]
+
+    accepted: list[str] = []
+    refused: list[str] = []
+
+    def worker(thread_id: str) -> None:
+        try:
+            backend._entry(config_for(thread_id))
+            accepted.append(thread_id)
+        except RuntimeError as error:
+            refused.append(str(error))
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in ("A", "B")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(accepted) == 1, "exactly one session may hold the lease"
+    assert len(refused) == 1
+    assert "already held by session" in refused[0]
+
+    sandboxes = {id(entry.lease.sandbox) for entry in backend._entries.values()}
+    assert len(backend._entries) == len(sandboxes) == 1
+
+
+def test_losing_the_lease_race_releases_the_opened_connection() -> None:
+    """A refused acquisition must not leak the connector it already opened."""
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    backend._entry(config_for("first"))
+
+    # Force a second session onto the same lease key.
+    def collide(config: Mapping[str, Any]) -> SandboxLease:
+        return SandboxLease(key="lease-first", sandbox=StubSandbox())
+
+    provider.acquire = collide  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="already held by session"):
+        backend._entry(config_for("second"))
+
+    # close_local ran for the rejected lease, so nothing was left open.
+    assert provider.closed_local == ["lease-first"]
+    assert "second" not in backend._entries
+
+
+def test_backend_is_not_kept_alive_by_its_shutdown_hook() -> None:
+    """Regression: atexit.register(self.close) made every backend immortal.
+
+    In a process creating one backend per tenant, that leaked the backend and
+    every sandbox connection it held for the life of the process.
+    """
+    refs = [weakref.ref(make_backend(RecordingProvider())) for _ in range(25)]
+    gc.collect()
+    assert [ref() for ref in refs].count(None) == 25
 
 
 def test_requires_a_provider() -> None:

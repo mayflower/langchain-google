@@ -21,6 +21,7 @@ import atexit
 import logging
 import threading
 import time
+import uuid
 import warnings
 import weakref
 from collections.abc import Callable, Iterable, Mapping
@@ -82,6 +83,17 @@ def default_session_resolver(config: Mapping[str, Any]) -> str:
         msg = "LangGraph configurable.thread_id is required for sandbox sessions"
         raise RuntimeError(msg)
     return thread_id
+
+
+def _make_atexit_hook(backend_ref: weakref.ref[Any]) -> Callable[[], None]:
+    """Build a shutdown hook that does not keep its backend alive."""
+
+    def hook() -> None:
+        backend = backend_ref()
+        if backend is not None:
+            backend.close()
+
+    return hook
 
 
 @dataclass
@@ -161,7 +173,13 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
         )
         self._cache_lock = threading.RLock()
         self._closed = False
-        atexit.register(self.close)
+        self._id = f"agent-sandbox/{uuid.uuid4()}"
+        # Registering the bound method would make atexit hold a strong
+        # reference, keeping every backend -- and its open connections --
+        # alive for the life of the process. Hold a weak reference instead,
+        # in a per-instance closure so close() can unregister exactly this one.
+        self._atexit_hook = _make_atexit_hook(weakref.ref(self))
+        atexit.register(self._atexit_hook)
 
     @staticmethod
     def _active_config() -> Mapping[str, Any]:
@@ -212,15 +230,6 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
                 f"{type(lease).__name__}"
             )
             raise TypeError(msg)
-        owner = self._lease_owners.get(lease.key)
-        if owner is not None and owner != session_key:
-            # Two sessions sharing one sandbox would cross-contaminate agent
-            # filesystems, so refuse rather than serve the wrong workspace.
-            msg = (
-                f"provider returned lease {lease.key!r} for session "
-                f"{session_key!r}, but it is already held by session {owner!r}"
-            )
-            raise RuntimeError(msg)
         now = time.monotonic()
         return _SessionEntry(
             backend=self._wrap(lease.sandbox),
@@ -307,10 +316,25 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
             self._touch(entry, now)
             return entry
         entry = self._acquire(session_key, config)
+        # Claiming the lease and publishing the entry must happen in one
+        # critical section. Two session keys hold *different* per-session
+        # locks, so a check performed outside this block could pass for both
+        # before either published, leaving two sessions on one sandbox.
         with self._cache_lock:
-            self._entries[session_key] = entry
-            self._lease_owners[entry.lease.key] = session_key
-        return entry
+            owner = self._lease_owners.get(entry.lease.key)
+            if owner is None or owner == session_key:
+                self._entries[session_key] = entry
+                self._lease_owners[entry.lease.key] = session_key
+                return entry
+        # Losing the race is not an error the caller can retry into safety:
+        # the provider handed the same sandbox to two sessions, which would
+        # cross-contaminate their filesystems. Release what we just opened.
+        self._release(entry)
+        msg = (
+            f"provider returned lease {entry.lease.key!r} for session "
+            f"{session_key!r}, but it is already held by session {owner!r}"
+        )
+        raise RuntimeError(msg)
 
     def _invalidate(self, session_key: str) -> None:
         with self._cache_lock:
@@ -367,14 +391,22 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
             entries = list(self._entries.values())
             self._entries.clear()
             self._lease_owners.clear()
-        atexit.unregister(self.close)
+        atexit.unregister(self._atexit_hook)
         for entry in entries:
             self._release(entry)
 
     @property
     def id(self) -> str:
-        """Return a stable, opaque identifier for the active session."""
-        return f"agent-sandbox/{self._entry().lease.key}"
+        """Return a stable identifier for this backend instance.
+
+        The DeepAgents protocol defines this as identifying the *backend
+        instance*, and this backend multiplexes many sessions, so it cannot
+        name any one of them. It is also a property: resolving it must never
+        reach the provider or provision a sandbox as a side effect.
+
+        For per-session identity use :meth:`get_session_lease`.
+        """
+        return self._id
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         return self._invoke("execute", command, timeout=timeout)
