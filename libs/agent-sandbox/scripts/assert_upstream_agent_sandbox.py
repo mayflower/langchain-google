@@ -55,16 +55,32 @@ HISTORICAL_REFERENCES = {
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 #: Only text worth scanning; skip caches, virtualenvs, and build output.
+#: Dockerfiles carry no suffix, so they are matched by name below.
 SCAN_SUFFIXES = {".py", ".toml", ".lock", ".md", ".yml", ".yaml", ".cfg", ".txt"}
+SCAN_NAMES = {"Dockerfile"}
 SKIP_DIRS = {
     ".venv",
     ".git",
     "dist",
+    "node_modules",
     "__pycache__",
     ".pytest_cache",
     ".ruff_cache",
     ".mypy_cache",
 }
+
+
+def scan_root() -> Path:
+    """Return the widest tree this guard should scan.
+
+    A fork reference can hide outside the package -- in a repo-root workflow
+    file, a Dockerfile, or release metadata -- so prefer the repository root
+    and fall back to the package when this is checked out standalone.
+    """
+    for candidate in (PACKAGE_ROOT, *PACKAGE_ROOT.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return PACKAGE_ROOT
 
 
 class ProvenanceError(AssertionError):
@@ -166,7 +182,11 @@ def check_no_fork_references(root: Path) -> None:
     """Verify no tracked source mentions the retired fork."""
     offenders: list[str] = []
     for path in root.rglob("*"):
-        if not path.is_file() or path.suffix not in SCAN_SUFFIXES:
+        if not path.is_file():
+            continue
+        if path.suffix not in SCAN_SUFFIXES and not any(
+            path.name.startswith(prefix) for prefix in SCAN_NAMES
+        ):
             continue
         if any(part in SKIP_DIRS for part in path.parts):
             continue
@@ -202,7 +222,7 @@ def main(argv: list[str]) -> int:
         check_pyproject(PACKAGE_ROOT / "pyproject.toml")
         check_lock(PACKAGE_ROOT / "uv.lock")
         check_installed()
-        check_no_fork_references(PACKAGE_ROOT)
+        check_no_fork_references(scan_root())
         for wheel in resolve_wheels(argv):
             check_wheel(wheel)
     except ProvenanceError as error:

@@ -220,6 +220,41 @@ def test_shell_metacharacters_in_paths_are_quoted(
         assert not leaked, f"unquoted shell operator {leaked} in: {issued}"
 
 
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "needle'; rm -rf /; echo '",
+        "$(id)",
+        "`whoami`",
+        "a && cat /etc/shadow",
+        'x" ; touch /tmp/pwned #',
+    ],
+)
+def test_shell_metacharacters_in_grep_patterns_are_quoted(
+    backend: AgentSandboxBackend, hostile: str
+) -> None:
+    """A search pattern is data, not shell syntax.
+
+    Patterns come straight from the model, so an unquoted one would let a
+    search turn into arbitrary command execution.
+    """
+    operators = {";", "&&", "||", "|", ">", ">>", "<", "&"}
+    backend.grep(hostile)
+
+    issued_commands = backend._sandbox.commands.commands
+    assert issued_commands, "grep issued no command to inspect"
+    for issued in issued_commands:
+        leaked = operators.intersection(shlex.split(issued))
+        assert not leaked, f"unquoted shell operator {leaked} in: {issued}"
+
+
+def test_glob_patterns_never_reach_the_shell(backend: AgentSandboxBackend) -> None:
+    """Glob matching happens in Python; only the base path is interpolated."""
+    backend.glob("*.py; rm -rf /")
+    for issued in backend._sandbox.commands.commands:
+        assert "rm -rf /" not in issued
+
+
 def test_execute_quotes_the_command_it_wraps(backend: AgentSandboxBackend) -> None:
     backend.execute("echo 'hi there'; rm -rf /")
     issued = backend._sandbox.commands.commands[-1]

@@ -100,6 +100,52 @@ def test_read_caller_limit_below_cap_still_wins() -> None:
     assert result.next_offset == 2
 
 
+def test_grep_is_bounded_and_flagged() -> None:
+    hits = "\n".join(f"/workspace/f{i}.py:1:match" for i in range(20))
+    backend = _backend(SandboxResultLimits(grep_matches=5), commands=_stdout(hits))
+    result = backend.grep("match")
+    assert len(result.matches) == 5
+    assert result.truncated is True
+
+
+def test_grep_caller_max_count_below_cap_still_wins() -> None:
+    hits = "\n".join(f"/workspace/f{i}.py:1:match" for i in range(20))
+    backend = _backend(SandboxResultLimits(grep_matches=15), commands=_stdout(hits))
+    result = backend.grep("match", max_count=2)
+    assert len(result.matches) == 2
+    assert result.truncated is True
+
+
+def test_grep_under_bound_is_not_flagged() -> None:
+    hits = "\n".join(f"/workspace/f{i}.py:1:match" for i in range(3))
+    backend = _backend(SandboxResultLimits(grep_matches=100), commands=_stdout(hits))
+    result = backend.grep("match")
+    assert len(result.matches) == 3
+    assert result.truncated is False
+
+
+def _find_records(count: int) -> str:
+    return "".join(f"f\t10\t0\t/workspace/f{i}.py\x00" for i in range(count))
+
+
+def test_glob_is_bounded_and_flagged() -> None:
+    backend = _backend(
+        SandboxResultLimits(glob_matches=4), commands=_stdout(_find_records(20))
+    )
+    result = backend.glob("*.py")
+    assert len(result.matches) == 4
+    assert result.truncated is True
+
+
+def test_glob_under_bound_is_not_flagged() -> None:
+    backend = _backend(
+        SandboxResultLimits(glob_matches=50), commands=_stdout(_find_records(3))
+    )
+    result = backend.glob("*.py")
+    assert len(result.matches) == 3
+    assert result.truncated is False
+
+
 def test_upload_beyond_bound_is_refused_not_dropped() -> None:
     backend = _backend(SandboxResultLimits(upload_files=2))
     payload = {f"/f{i}.txt": b"data" for i in range(5)}
