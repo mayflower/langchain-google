@@ -30,7 +30,7 @@ authors = []
 version = "0.1.0"
 requires-python = ">=3.11.0,<4.0.0"
 dependencies = [
-    "deepagents>=0.7.0b2,<0.8.0",
+    "deepagents>=0.7.4,<0.8.0",
     "k8s-agent-sandbox @ git+https://github.com/mayflower/agent-sandbox.git@a2419b9b7eaeec99f636c46a46ca55731d3f52fc#subdirectory=clients/python/agentic-sandbox-client",
     "wcmatch>=11.0,<12.0",
 ]

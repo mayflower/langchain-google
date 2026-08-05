@@ -276,8 +276,18 @@ def test_read_window_binary_and_out_of_range() -> None:
     assert response.end_line == 2
     assert response.next_offset == 2
     assert "exceeds file length" in backend.read("/x.txt", offset=99).error
-    assert "non-negative" in backend.read("/x.txt", offset=-1).error
-    assert "positive" in backend.read("/x.txt", limit=0).error
+
+    # DeepAgents 0.7.4 clamps degenerate model-supplied bounds rather than
+    # erroring: a negative offset floors at 0, and a non-positive limit is an
+    # uninspected window flagged with no_lines_requested.
+    clamped = backend.read("/x.txt", offset=-1, limit=1)
+    assert clamped.file_data["content"] == "zero\n"
+    assert clamped.start_line == 1
+    for degenerate in (0, -5):
+        empty = backend.read("/x.txt", limit=degenerate)
+        assert empty.no_lines_requested is True
+        assert empty.file_data["content"] == ""
+        assert empty.error is None
 
     bad = AgentSandboxBackend.from_existing(StubSandbox(files=StubFiles(read=b"\xff")))
     file_data = bad.read("/bad.bin").file_data

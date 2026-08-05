@@ -47,6 +47,7 @@ from deepagents.backends.protocol import (
 from deepagents.backends.utils import (
     _get_backend_read_file_type,
     check_empty_content,
+    normalize_read_bounds,
 )
 from k8s_agent_sandbox.exceptions import SandboxNotFoundError
 
@@ -474,10 +475,15 @@ class AgentSandboxBackend(SandboxBackendProtocol):
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         """Read raw UTF-8 content from a file, optionally by line window."""
-        if offset < 0:
-            return ReadResult(error=f"Line offset must be non-negative, got {offset}")
-        if limit <= 0:
-            return ReadResult(error=f"Line limit must be positive, got {limit}")
+        offset, limit = normalize_read_bounds(offset, limit)
+        if limit == 0:
+            # A zero-line window is not an error: DeepAgents distinguishes a
+            # never-inspected window from a genuinely empty file, and reaching
+            # the sandbox at all would be wasted work.
+            return ReadResult(
+                file_data=FileData(content="", encoding="utf-8"),
+                no_lines_requested=True,
+            )
         self._assert_sandbox()
         with self._track_op():
             try:
