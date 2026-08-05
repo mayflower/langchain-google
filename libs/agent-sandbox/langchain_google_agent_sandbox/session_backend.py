@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import asyncio
-import atexit
 import logging
 import threading
 import time
@@ -85,17 +84,6 @@ def default_session_resolver(config: Mapping[str, Any]) -> str:
     return thread_id
 
 
-def _make_atexit_hook(backend_ref: weakref.ref[Any]) -> Callable[[], None]:
-    """Build a shutdown hook that does not keep its backend alive."""
-
-    def hook() -> None:
-        backend = backend_ref()
-        if backend is not None:
-            backend.close()
-
-    return hook
-
-
 @dataclass
 class _SessionEntry:
     """One process-local cached session."""
@@ -104,6 +92,40 @@ class _SessionEntry:
     lease: SandboxLease
     last_accessed_at: float
     last_touched_at: float
+
+
+def _release_entry(provider: SandboxSessionProvider, entry: _SessionEntry) -> None:
+    """Release local resources for one entry. Never touches remote state."""
+    try:
+        entry.backend.close()
+    finally:
+        try:
+            provider.close_local(entry.lease)
+        except Exception:
+            logger.exception(
+                "provider.close_local failed for lease %s", entry.lease.key
+            )
+
+
+def _release_all(
+    provider: SandboxSessionProvider,
+    entries: dict[str, _SessionEntry],
+    lease_owners: dict[str, str],
+    lock: threading.RLock,
+) -> None:
+    """Release every cached session, deleting no remote infrastructure.
+
+    Deliberately a module-level function over plain containers rather than a
+    method: it is the target of a :func:`weakref.finalize`, so referencing the
+    backend would keep it -- and every connection it holds -- alive for the
+    life of the process.
+    """
+    with lock:
+        pending = list(entries.values())
+        entries.clear()
+        lease_owners.clear()
+    for entry in pending:
+        _release_entry(provider, entry)
 
 
 class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
@@ -174,12 +196,19 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
         self._cache_lock = threading.RLock()
         self._closed = False
         self._id = f"agent-sandbox/{uuid.uuid4()}"
-        # Registering the bound method would make atexit hold a strong
-        # reference, keeping every backend -- and its open connections --
-        # alive for the life of the process. Hold a weak reference instead,
-        # in a per-instance closure so close() can unregister exactly this one.
-        self._atexit_hook = _make_atexit_hook(weakref.ref(self))
-        atexit.register(self._atexit_hook)
+        # weakref.finalize, not atexit.register(self.close): registering a
+        # bound method makes atexit hold the backend forever, and a plain
+        # atexit closure still accumulates one dead entry per abandoned
+        # backend. A finalizer runs at collection *and* at interpreter exit,
+        # and removes itself from the registry either way.
+        self._finalizer = weakref.finalize(
+            self,
+            _release_all,
+            provider,
+            self._entries,
+            self._lease_owners,
+            self._cache_lock,
+        )
 
     @staticmethod
     def _active_config() -> Mapping[str, Any]:
@@ -252,19 +281,18 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
 
     def _release(self, entry: _SessionEntry) -> None:
         """Release local resources for one entry. Never touches remote state."""
-        try:
-            entry.backend.close()
-        finally:
-            try:
-                self._provider.close_local(entry.lease)
-            except Exception:
-                logger.exception(
-                    "provider.close_local failed for lease %s", entry.lease.key
-                )
+        _release_entry(self._provider, entry)
 
     def _evict_idle_entries(self, *, exclude: str | None = None) -> None:
         ttl = self._local_cache_ttl_seconds
         with self._cache_lock:
+            # This runs on every file operation, so skip the scan when it
+            # provably cannot evict: nothing can expire without a TTL, and
+            # with room to spare the projected size (at most count + 1) stays
+            # within the bound. Exact, not a throttle -- a TTL-expired entry
+            # is still evicted on the very next operation.
+            if ttl is None and len(self._entries) < self._max_cached_sessions:
+                return
             entries = list(self._entries.items())
         cutoff = time.monotonic() - ttl if ttl is not None else None
         candidates = {
@@ -385,15 +413,10 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
     def close(self) -> None:
         """Release every local connector. Remote Claims are left running."""
         with self._cache_lock:
-            if self._closed:
-                return
             self._closed = True
-            entries = list(self._entries.values())
-            self._entries.clear()
-            self._lease_owners.clear()
-        atexit.unregister(self._atexit_hook)
-        for entry in entries:
-            self._release(entry)
+        # Running the finalizer marks it dead and unregisters it, so this is
+        # idempotent and a later interpreter exit will not release twice.
+        self._finalizer()
 
     @property
     def id(self) -> str:

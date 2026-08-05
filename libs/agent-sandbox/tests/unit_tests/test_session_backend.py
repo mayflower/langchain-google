@@ -529,6 +529,64 @@ def test_backend_is_not_kept_alive_by_its_shutdown_hook() -> None:
     assert [ref() for ref in refs].count(None) == 25
 
 
+@pytest.mark.skipif(
+    not hasattr(weakref.finalize, "_registry"),
+    reason="finalizer registry is a CPython implementation detail",
+)
+def test_shutdown_hooks_do_not_accumulate_for_abandoned_backends() -> None:
+    """A plain atexit closure still leaked one dead entry per backend."""
+    registry = weakref.finalize._registry  # type: ignore[attr-defined]
+    before = len(registry)
+    for _ in range(25):
+        make_backend(RecordingProvider())
+    gc.collect()
+    assert len(registry) == before
+
+
+def test_dropping_a_backend_closes_its_connections_at_collection() -> None:
+    """Abandoned sessions must not stay connected until the process exits."""
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    backend._entry(config_for("t1"))
+    sandbox = provider.sandboxes["t1"]
+    assert provider.closed_local == []
+
+    del backend
+    gc.collect()
+
+    assert provider.closed_local == ["lease-t1"]
+    assert sandbox.closed is True
+
+
+def test_close_is_idempotent_and_releases_once() -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    backend._entry(config_for("t1"))
+    for _ in range(3):
+        backend.close()
+    assert provider.closed_local == ["lease-t1"]
+
+
+def test_eviction_fast_path_does_not_skip_ttl_expiry() -> None:
+    """The scan is skipped only when it provably cannot evict."""
+    provider = RecordingProvider()
+    # No TTL and room to spare: nothing can be evicted, scan short-circuits.
+    roomy = make_backend(provider, local_cache_ttl_seconds=None, max_cached_sessions=8)
+    roomy._entry(config_for("a"))
+    roomy._entry(config_for("b"))
+    assert set(roomy._entries) == {"a", "b"}
+    assert provider.closed_local == []
+
+    # With a TTL, an expired entry is still evicted on the very next call.
+    ttl_provider = RecordingProvider()
+    strict = make_backend(ttl_provider, local_cache_ttl_seconds=1)
+    entry = strict._entry(config_for("old"))
+    entry.last_accessed_at = time.monotonic() - 10
+    strict._entry(config_for("new"))
+    assert "old" not in strict._entries
+    assert ttl_provider.closed_local == ["lease-old"]
+
+
 def test_requires_a_provider() -> None:
     with pytest.raises(ValueError, match="provider is required"):
         ProviderSessionAgentSandboxBackend(None)  # type: ignore[arg-type]
