@@ -7,6 +7,7 @@ from langchain_google_agent_sandbox.factory import (
     create_sandbox_backend,
     create_sandbox_backend_factory,
 )
+from langchain_google_agent_sandbox.limits import SandboxResultLimits
 from langchain_google_agent_sandbox.policy import SandboxPolicyWrapper
 from langchain_google_agent_sandbox.provider import (
     SandboxLease,
@@ -28,6 +29,7 @@ __all__ = [
     "AgentSandboxBackend",
     "SandboxLease",
     "SandboxPolicyWrapper",
+    "SandboxResultLimits",
     "SandboxSessionProvider",
     "SessionAgentSandboxBackend",
     "SessionLifecycleContext",

@@ -52,13 +52,13 @@ from deepagents.backends.utils import (
 from k8s_agent_sandbox.exceptions import SandboxNotFoundError
 
 from langchain_google_agent_sandbox import _compat
-from langchain_google_agent_sandbox._compat import SESSION_LABEL_KEY
 from langchain_google_agent_sandbox._errors import is_timeout_exception
 from langchain_google_agent_sandbox._paths import (
     compile_glob,
     compile_grep_include_glob,
     reject_control_chars,
 )
+from langchain_google_agent_sandbox.limits import DEFAULT_LIMITS, SandboxResultLimits
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +71,16 @@ class AgentSandboxBackend(SandboxBackendProtocol):
     ``/workspace`` because DeepAgents agents commonly expect a workspace-like
     writable directory instead of an application installation directory.
 
-    The adapter can wrap an existing sandbox handle or manage a sandbox created
-    from a template. Managed sandboxes are created only when the backend is
-    entered, which keeps import and construction free of Kubernetes calls.
-    """
+    The adapter can wrap an existing sandbox handle or manage an ephemeral
+    sandbox created from a warm pool. Managed sandboxes are created only when
+    the backend is entered, which keeps import and construction free of
+    Kubernetes calls.
 
-    SESSION_LABEL_KEY = SESSION_LABEL_KEY
+    This class is a protocol adapter, not a sandbox control plane. It does not
+    discover, label, or reattach to Claims by identity; durable session
+    ownership belongs to a
+    :class:`~langchain_google_agent_sandbox.provider.SandboxSessionProvider`.
+    """
 
     def __init__(
         self,
@@ -86,12 +90,12 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         allow_absolute_paths: bool = False,
         sdk_client: Any | None = None,
         runtime_root: str = "/workspace",
+        limits: SandboxResultLimits | None = None,
         _warm_pool: str | None = None,
         _namespace: str = "default",
         _sandbox_ready_timeout: int = 180,
         _labels: dict[str, str] | None = None,
         _shutdown_after_seconds: int | None = None,
-        _session_id: str | None = None,
         _default_timeout_seconds: int | None = None,
     ) -> None:
         if not root_dir.startswith("/"):
@@ -100,8 +104,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         if not runtime_root.startswith("/"):
             msg = f"runtime_root must be an absolute path, got: {runtime_root}"
             raise ValueError(msg)
-        if _session_id is not None:
-            _compat.validate_label_value(_session_id)
+        self._limits = limits if limits is not None else DEFAULT_LIMITS
         self._sandbox = sandbox
         self._root_dir = posixpath.normpath(root_dir)
         self._runtime_root = posixpath.normpath(runtime_root)
@@ -113,9 +116,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         self._sandbox_ready_timeout = _sandbox_ready_timeout
         self._labels = _labels
         self._shutdown_after_seconds = _shutdown_after_seconds
-        self._session_id = _session_id
         self._default_timeout_seconds = _default_timeout_seconds
-        self._reattached = False
         self._draining = False
         self._inflight = 0
         self._inflight_cv = threading.Condition(threading.Lock())
@@ -129,6 +130,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         allow_absolute_paths: bool = False,
         runtime_root: str = "/workspace",
         default_timeout_seconds: int | None = 120,
+        limits: SandboxResultLimits | None = None,
     ) -> AgentSandboxBackend:
         """Wrap an already-connected sandbox without owning its lifecycle.
 
@@ -144,6 +146,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 trusted workflows.
             runtime_root: Root understood by the SDK filesystem API.
             default_timeout_seconds: Default command timeout.
+            limits: Bounds applied to returned results.
 
         Returns:
             An unmanaged backend ready for immediate use.
@@ -154,6 +157,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             manage_lifecycle=False,
             allow_absolute_paths=allow_absolute_paths,
             runtime_root=runtime_root,
+            limits=limits,
             _default_timeout_seconds=default_timeout_seconds,
         )
 
@@ -168,28 +172,33 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         sandbox_ready_timeout: int = 180,
         labels: dict[str, str] | None = None,
         shutdown_after_seconds: int | None = None,
-        session_id: str | None = None,
         default_timeout_seconds: int | None = 120,
+        limits: SandboxResultLimits | None = None,
     ) -> AgentSandboxBackend:
-        """Create a lifecycle-managed backend from a SandboxWarmPool.
+        """Create a lifecycle-managed **ephemeral** backend from a warm pool.
 
-        The sandbox is created on ``__enter__`` and deleted on ``__exit__``.
-        When ``session_id`` is supplied, ``__enter__`` first searches for an
-        existing claim labeled with that session and reattaches if exactly one
-        match exists. Multiple matches are refused because silently picking one
-        could attach the agent to the wrong persistent filesystem.
+        The sandbox is created with an SDK-generated random name on
+        ``__enter__`` and deleted on ``__exit__``.
+
+        !!! warning
+            This is an ephemeral convenience API. The Claim it creates is
+            deleted when the context exits, so it is unsuitable for durable
+            thread persistence. For sessions that must survive a process,
+            use
+            :class:`~langchain_google_agent_sandbox.session_backend.ProviderSessionAgentSandboxBackend`
+            with a product-owned provider.
 
         Args:
-            client: Configured released ``SandboxClient``.
+            client: Configured official ``SandboxClient``.
             warm_pool: SandboxWarmPool name.
             namespace: Kubernetes namespace containing the claim.
             root_dir: Virtual root exposed to DeepAgents.
             allow_absolute_paths: Allow writes outside ``root_dir``.
             sandbox_ready_timeout: Readiness wait in seconds.
             labels: Additional SandboxClaim labels.
-            shutdown_after_seconds: Optional claim TTL when the SDK supports it.
-            session_id: Stable label value used for reattach.
+            shutdown_after_seconds: Optional claim TTL.
             default_timeout_seconds: Default command timeout for execute calls.
+            limits: Bounds applied to returned results.
 
         Returns:
             A backend that must be entered before use.
@@ -200,12 +209,12 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             manage_lifecycle=True,
             allow_absolute_paths=allow_absolute_paths,
             sdk_client=client,
+            limits=limits,
             _warm_pool=warm_pool,
             _namespace=namespace,
             _sandbox_ready_timeout=sandbox_ready_timeout,
             _labels=labels,
             _shutdown_after_seconds=shutdown_after_seconds,
-            _session_id=session_id,
             _default_timeout_seconds=default_timeout_seconds,
         )
 
@@ -220,8 +229,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         sandbox_ready_timeout: int = 180,
         labels: dict[str, str] | None = None,
         shutdown_after_seconds: int | None = None,
-        session_id: str | None = None,
         default_timeout_seconds: int | None = 120,
+        limits: SandboxResultLimits | None = None,
     ) -> AgentSandboxBackend:
         """Deprecated alias for :meth:`from_warm_pool`."""
         warnings.warn(
@@ -238,8 +247,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             sandbox_ready_timeout=sandbox_ready_timeout,
             labels=labels,
             shutdown_after_seconds=shutdown_after_seconds,
-            session_id=session_id,
             default_timeout_seconds=default_timeout_seconds,
+            limits=limits,
         )
 
     def __enter__(self) -> AgentSandboxBackend:
@@ -250,14 +259,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         if self._sdk_client is None:
             msg = "Cannot manage lifecycle without an sdk_client"
             raise RuntimeError(msg)
-        self._reattached = False
         self._draining = False
-        if self._try_reattach():
-            return self
-
         labels = dict(self._labels) if self._labels else {}
-        if self._session_id is not None:
-            labels[self.SESSION_LABEL_KEY] = self._session_id
         self._sandbox = _compat.create_sandbox(
             self._sdk_client,
             warm_pool=cast("str", self._warm_pool),
@@ -278,12 +281,6 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             self._draining = True
             while self._inflight > 0:
                 self._inflight_cv.wait()
-        if self._reattached:
-            close_connection = getattr(self._sandbox, "close_connection", None)
-            if callable(close_connection):
-                close_connection()
-            self._sandbox = None
-            return
         claim = getattr(self._sandbox, "claim_name", None)
         namespace = getattr(self._sandbox, "namespace", None) or self._namespace
         cleanup_error: BaseException | None = None
@@ -328,7 +325,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
 
     def _register_finalizer(self) -> None:
         """Register fallback cleanup for a factory-managed ephemeral Claim."""
-        if self._reattached or self._sandbox is None or self._sdk_client is None:
+        if self._sandbox is None or self._sdk_client is None:
             return
         from langchain_google_agent_sandbox._lifecycle import factory_atexit_cleanup
 
@@ -338,32 +335,6 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             self._sdk_client,
             self._sandbox,
         )
-
-    def _try_reattach(self) -> bool:
-        if self._sdk_client is None or self._session_id is None:
-            return False
-        selector = f"{self.SESSION_LABEL_KEY}={self._session_id}"
-        claims = _compat.list_sandbox_claims(
-            self._sdk_client,
-            namespace=self._namespace,
-            label_selector=selector,
-        )
-        if not claims:
-            return False
-        if len(claims) > 1:
-            msg = (
-                f"Refusing to reattach: {len(claims)} claims match "
-                f"session_id={self._session_id!r} in namespace {self._namespace!r}"
-            )
-            raise RuntimeError(msg)
-        self._sandbox = _compat.get_sandbox(
-            self._sdk_client,
-            claim_name=claims[0],
-            namespace=self._namespace,
-            warm_pool=self._warm_pool,
-        )
-        self._reattached = True
-        return True
 
     def close(self) -> None:
         """Close only the local connector without deleting the Claim."""
@@ -435,11 +406,26 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         combined = result.stdout
         if result.stderr:
             combined = f"{combined}\n{result.stderr}" if combined else result.stderr
+        bounded, truncated = self._bound_output(combined)
         return ExecuteResponse(
-            output=combined,
+            output=bounded,
             exit_code=result.exit_code,
-            truncated=False,
+            truncated=truncated,
         )
+
+    def _bound_output(self, output: str) -> tuple[str, bool]:
+        """Clip command output to the configured byte bound.
+
+        Returns:
+            The possibly-clipped output and whether clipping occurred. Clipping
+            happens on the UTF-8 encoding and decodes back with ``ignore`` so a
+            bound that lands mid-codepoint cannot produce invalid text.
+        """
+        cap = self._limits.execute_output_bytes
+        encoded = output.encode("utf-8")
+        if len(encoded) <= cap:
+            return output, False
+        return encoded[:cap].decode("utf-8", errors="ignore"), True
 
     def ls(self, path: str) -> LsResult:
         """List directory entries with stable ordering and metadata where present."""
@@ -512,7 +498,9 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             return ReadResult(
                 error=f"Line offset {offset} exceeds file length ({len(lines)} lines)"
             )
-        end = min(len(lines), start + limit)
+        # The caller's window is further bounded by the configured cap; the
+        # remainder is reported through next_offset rather than dropped.
+        end = min(len(lines), start + min(limit, self._limits.read_lines))
         selected = "".join(lines[start:end])
         return ReadResult(
             file_data=FileData(content=selected, encoding="utf-8"),
@@ -718,8 +706,11 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             matches.append(
                 GrepMatch(path=self._to_public(raw_path), line=line_int, text=text)
             )
-        if max_count is not None and len(matches) > max_count:
-            return GrepResult(matches=matches[:max_count], truncated=True)
+        effective_max = self._limits.grep_matches
+        if max_count is not None:
+            effective_max = min(effective_max, max_count)
+        if len(matches) > effective_max:
+            return GrepResult(matches=matches[:effective_max], truncated=True)
         return GrepResult(matches=matches)
 
     def glob(self, pattern: str, path: str | None = None) -> GlobResult:
@@ -792,6 +783,9 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 pass
             entries.append(info)
         entries.sort(key=lambda item: item["path"])
+        cap = self._limits.glob_matches
+        if len(entries) > cap:
+            return GlobResult(matches=entries[:cap], truncated=True)
         return GlobResult(matches=entries)
 
     def upload_files(
@@ -800,6 +794,12 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         """Upload files and report per-file success or failure."""
         self._assert_sandbox()
         pairs = list(files.items()) if isinstance(files, dict) else list(files)
+        # Files past the bound are refused individually rather than dropped, so
+        # the caller always receives one response per requested file.
+        pairs, overflow = (
+            pairs[: self._limits.upload_files],
+            pairs[self._limits.upload_files :],
+        )
         responses: list[FileUploadResponse] = []
         with self._track_op():
             for path, payload in pairs:
@@ -844,14 +844,23 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                     )
                     continue
                 responses.append(FileUploadResponse(path=path, error=None))
+        responses.extend(
+            FileUploadResponse(path=path, error="limit_exceeded")
+            for path, _ in overflow
+        )
         return responses
 
     def download_files(self, paths: Iterable[str]) -> list[FileDownloadResponse]:
         """Download files and report per-file success or failure."""
         self._assert_sandbox()
+        requested = list(paths)
+        requested, overflow = (
+            requested[: self._limits.download_files],
+            requested[self._limits.download_files :],
+        )
         responses: list[FileDownloadResponse] = []
         with self._track_op():
-            for path in paths:
+            for path in requested:
                 try:
                     internal_path = self._to_internal(path)
                 except ValueError:
@@ -885,47 +894,11 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 responses.append(
                     FileDownloadResponse(path=path, content=content, error=None)
                 )
-        return responses
-
-    @staticmethod
-    def delete_all(
-        client: Any,
-        namespace: str = "default",
-        best_effort: bool = True,
-        label_selector: str | None = None,
-    ) -> int:
-        """Delete sandbox claims in ``namespace``.
-
-        Args:
-            client: Configured released ``SandboxClient``.
-            namespace: Namespace to clean up.
-            best_effort: Continue after individual delete failures.
-            label_selector: Optional Kubernetes label selector. Without it,
-                every claim in the namespace is deleted.
-
-        Returns:
-            Number of successfully deleted claims.
-        """
-        claims = _compat.list_sandbox_claims(
-            client,
-            namespace=namespace,
-            label_selector=label_selector,
+        responses.extend(
+            FileDownloadResponse(path=path, content=None, error="limit_exceeded")
+            for path in overflow
         )
-        deleted = 0
-        for claim in claims:
-            try:
-                _compat.delete_sandbox(client, claim_name=claim, namespace=namespace)
-                deleted += 1
-            except Exception:
-                if not best_effort:
-                    raise
-                logger.warning(
-                    "delete_all: failed to delete %s in namespace %s",
-                    claim,
-                    namespace,
-                    exc_info=True,
-                )
-        return deleted
+        return responses
 
     @property
     def id(self) -> str:

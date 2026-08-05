@@ -114,6 +114,7 @@ class StubClient:
         self.claims = claims or []
         self.created: list[dict[str, Any]] = []
         self.deleted: list[tuple[str, str]] = []
+        self.listed: list[tuple[str, str | None]] = []
         self.sandbox = StubSandbox()
 
     def create_sandbox(
@@ -142,6 +143,7 @@ class StubClient:
     ) -> list[str]:
         self.list_namespace = namespace
         self.list_selector = label_selector
+        self.listed.append((namespace, label_selector))
         return self.claims
 
     def get_sandbox(self, claim_name: str, namespace: str = "default") -> StubSandbox:
@@ -470,37 +472,36 @@ def test_grep_applies_include_glob_and_total_max_count() -> None:
     assert complete.truncated is False
 
 
-def test_lifecycle_create_delete_reattach_and_refusals() -> None:
+def test_ephemeral_lifecycle_creates_and_deletes_its_own_claim() -> None:
     client = StubClient()
     backend = AgentSandboxBackend.from_warm_pool(
         client,
         "python",
         namespace="ns",
-        session_id="thread-1",
         shutdown_after_seconds=30,
     )
     with backend:
-        assert (
-            client.created[0]["labels"][AgentSandboxBackend.SESSION_LABEL_KEY]
-            == "thread-1"
-        )
         assert backend.id == "ns/claim-1"
     assert client.deleted == [("claim-1", "ns")]
 
-    client = StubClient(claims=["claim-old"])
-    with AgentSandboxBackend.from_warm_pool(
-        client, "python", namespace="ns", session_id="s1"
-    ) as value:
-        assert value.id == "ns/claim-old"
-    assert client.deleted == []
-
-    with pytest.raises(RuntimeError, match="Refusing to reattach"):
-        AgentSandboxBackend.from_warm_pool(
-            StubClient(claims=["a", "b"]), "python", session_id="s1"
-        ).__enter__()
-
     with pytest.raises(RuntimeError, match="not initialized"):
         AgentSandboxBackend.from_warm_pool(StubClient(), "python").execute("pwd")
+
+
+def test_ephemeral_backend_never_discovers_claims_by_label() -> None:
+    """Identity-based Claim discovery belongs to the provider, not here."""
+    client = StubClient(claims=["claim-old"])
+    backend = AgentSandboxBackend.from_warm_pool(client, "python", namespace="ns")
+    with backend:
+        # A pre-existing Claim is ignored: the ephemeral path always creates
+        # its own rather than adopting one it found by listing.
+        assert backend.id == "ns/claim-1"
+    assert client.listed == []
+    assert client.deleted == [("claim-1", "ns")]
+
+    assert not hasattr(AgentSandboxBackend, "_try_reattach")
+    assert not hasattr(AgentSandboxBackend, "SESSION_LABEL_KEY")
+    assert not hasattr(AgentSandboxBackend, "delete_all")
 
 
 def test_drain_rejects_operations_and_cleanup_errors_surface() -> None:
@@ -711,7 +712,6 @@ def test_backend_helper_returns_deepagents_07_instance() -> None:
         "python",
         namespace="ns",
         client=client,
-        session_id="thread-2",
     )
 
     assert isinstance(backend, AgentSandboxBackend)
@@ -750,19 +750,19 @@ def test_factory_finalizer_is_detached_after_explicit_exit() -> None:
     assert client.deleted == [("claim-1", "ns")]
 
 
-def test_factory_preserves_reattached_backend() -> None:
+def test_factory_creates_its_own_ephemeral_claim() -> None:
+    """The deprecated factory path no longer adopts a pre-existing Claim."""
     client = StubClient(claims=["claim-old"])
     with pytest.warns(DeprecationWarning, match="concrete backend"):
         backend = create_sandbox_backend_factory(
             "python",
             namespace="ns",
             client=client,
-            session_id="thread-2",
         )
 
     assert isinstance(backend, AgentSandboxBackend)
-    assert backend.id == "ns/claim-old"
-    assert client.created == []
-    assert backend._finalizer is None
+    assert backend.id == "ns/claim-1"
+    assert len(client.created) == 1
+    assert client.listed == []
     backend.__exit__(None, None, None)
-    assert client.deleted == []
+    assert client.deleted == [("claim-1", "ns")]
