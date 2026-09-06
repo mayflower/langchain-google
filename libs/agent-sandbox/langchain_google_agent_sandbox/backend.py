@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import posixpath
 import shlex
@@ -56,11 +57,76 @@ from langchain_google_agent_sandbox._errors import is_timeout_exception
 from langchain_google_agent_sandbox._paths import (
     compile_glob,
     compile_grep_include_glob,
+    glob_regexes,
     reject_control_chars,
 )
 from langchain_google_agent_sandbox.limits import DEFAULT_LIMITS, SandboxResultLimits
 
 logger = logging.getLogger(__name__)
+
+# Match in the sandbox and stop at the result/time bound, before transporting
+# output. Only stdlib Python is needed in the runtime, not wcmatch.
+_GLOB_SCRIPT = """
+import json, os, re, stat, sys, time
+root, expressions, prefix, max_depth, cap, budget = json.loads(sys.argv[1])
+matchers = [re.compile(expression) for expression in expressions]
+deadline = time.monotonic() + budget
+count = 0
+truncated = False
+start = root
+if os.path.islink(start):
+    sys.exit(0)
+for part in prefix:
+    start = os.path.join(start, part)
+    if os.path.islink(start):
+        sys.exit(0)
+pending = [(start, len(prefix))]
+while pending:
+    if time.monotonic() >= deadline:
+        truncated = True
+        break
+    directory, depth = pending.pop()
+    try:
+        with os.scandir(directory) as children:
+            for child in children:
+                if time.monotonic() >= deadline:
+                    truncated = True
+                    break
+                if child.is_dir(follow_symlinks=False):
+                    if max_depth is None or depth + 1 < max_depth:
+                        pending.append((child.path, depth + 1))
+                    continue
+                relative = os.path.relpath(child.path, root)
+                if not any(matcher.match(relative) for matcher in matchers):
+                    continue
+                try:
+                    info = child.stat(follow_symlinks=False)
+                except OSError:
+                    truncated = True
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                count += 1
+                if count > cap:
+                    truncated = True
+                    break
+                sys.stdout.write('f\\t%d\\t%s\\t%s\\0' % (
+                    info.st_size, info.st_mtime, child.path))
+    except FileNotFoundError:
+        if directory == root:
+            raise
+    except OSError:
+        if directory == root:
+            raise
+        truncated = True
+    if count > cap:
+        break
+    if time.monotonic() >= deadline:
+        truncated = True
+        break
+if truncated:
+    sys.stdout.write('truncated\\0')
+"""
 
 
 class AgentSandboxBackend(SandboxBackendProtocol):
@@ -723,7 +789,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 error="Path traversal is not allowed in glob patterns",
             )
         try:
-            matcher = compile_glob(pattern.lstrip("/"))
+            matcher = compile_glob(pattern)
+            expressions = glob_regexes(pattern)
         except Exception as error:
             return GlobResult(
                 matches=[],
@@ -736,15 +803,37 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 return GlobResult(
                     matches=[], error=f"Invalid path '{base_path}': {error}"
                 )
-            command = (
-                f"find -P {shlex.quote(internal_path)} -mindepth 1"
-                f" -type f -printf 'f\\t%s\\t%T@\\t%p\\0'"
+            # Slash-containing patterns are root-relative. Avoid visiting
+            # unrelated subtrees when their leading directory is literal.
+            prefix: list[str] = []
+            if "/" in pattern:
+                for part in pattern.lstrip("/").split("/")[:-1]:
+                    if not part or any(char in part for char in "*?[]{\\"):
+                        break
+                    prefix.append(part)
+            max_depth = None
+            if (
+                "/" in pattern
+                and not any(char in pattern for char in "{\\")
+                and "**" not in pattern
+            ):
+                max_depth = len(pattern.lstrip("/").split("/"))
+            # Leave headroom below DeepAgents' ten-second tool deadline.
+            command_timeout = min(8, self._default_timeout_seconds or 8)
+            budget = min(5.0, command_timeout * 0.75)
+            arguments = json.dumps(
+                [
+                    internal_path,
+                    expressions,
+                    prefix,
+                    max_depth,
+                    self._limits.glob_matches,
+                    budget,
+                ]
             )
-            run_kwargs: dict[str, Any] = {}
-            if self._default_timeout_seconds is not None:
-                run_kwargs["timeout"] = self._default_timeout_seconds
+            command = f"python3 -c {shlex.quote(_GLOB_SCRIPT)} {shlex.quote(arguments)}"
             try:
-                result = sandbox.commands.run(command, **run_kwargs)
+                result = sandbox.commands.run(command, timeout=command_timeout)
             except SandboxNotFoundError:
                 raise
             except Exception as error:
@@ -784,7 +873,11 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             entries.append(info)
         entries.sort(key=lambda item: item["path"])
         cap = self._limits.glob_matches
-        if len(entries) > cap:
+        if (
+            len(entries) > cap
+            or "truncated" in result.stdout.split("\x00")
+            or result.exit_code != 0
+        ):
             return GlobResult(matches=entries[:cap], truncated=True)
         return GlobResult(matches=entries)
 

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import posixpath
+import re
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import PurePosixPath
@@ -36,11 +37,19 @@ def canonical_public_path(path: str) -> str:
 
 
 @lru_cache(maxsize=256)
+def glob_regexes(pattern: str) -> list[str]:
+    """Translate DeepAgents glob semantics for local or sandbox matching."""
+    flags = wcglob.BRACE | wcglob.GLOBSTAR | wcglob.DOTMATCH
+    normalized = pattern.lstrip("/") if "/" in pattern else "**/" + pattern
+    includes, _ = wcglob.translate(normalized, flags=flags)
+    return includes
+
+
+@lru_cache(maxsize=256)
 def compile_glob(pattern: str) -> Callable[[str], bool]:
     """Compile DeepAgents recursive glob semantics, including brace expansion."""
-    flags = wcglob.BRACE | wcglob.GLOBSTAR | wcglob.DOTMATCH
-    compiled = wcglob.compile("**/" + pattern.lstrip("/"), flags=flags)
-    return lambda path: bool(compiled.match(path))
+    expressions = [re.compile(expression) for expression in glob_regexes(pattern)]
+    return lambda path: any(expression.match(path) for expression in expressions)
 
 
 @lru_cache(maxsize=256)

@@ -338,9 +338,14 @@ backend. The examples cover local tunnel, gateway, and direct API URL modes.
 
 The runtime should provide:
 
-- `sh`, `grep`, `find`, `mkdir`, `test`, `base64`
+- `sh`, `grep`, `find`, `mkdir`, `test`, `base64`, `python3`
 - API endpoints compatible with released `k8s-agent-sandbox`
 - A writable `/workspace` directory by default
+
+Glob matching runs in the sandbox using Python's standard library. Searches
+stop at the configured match limit or a five-second traversal budget and mark
+incomplete results as truncated. Patterns without a slash match filenames at
+any depth; slash-containing patterns are relative to the search root.
 
 The reference runtime in `examples/deepagents-runtime` documents the expected
 HTTP surface: `/execute`, `/upload`, `/download`, `/list`, and `/exists`.

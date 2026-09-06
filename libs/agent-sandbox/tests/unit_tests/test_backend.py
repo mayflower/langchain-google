@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shlex
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -21,6 +23,7 @@ from langchain_google_agent_sandbox._paths import (
     compile_glob,
     compile_grep_include_glob,
 )
+from langchain_google_agent_sandbox.limits import SandboxResultLimits
 
 
 class FileEntry:
@@ -451,6 +454,92 @@ def test_grep_glob_and_malformed_output() -> None:
     assert compile_grep_include_glob("src/**/*.py")("src/pkg/main.py")
     assert not compile_grep_include_glob("src/**/*.py")("other/main.py")
     assert "traversal" in backend.glob("../*.py").error
+
+
+class LocalCommands(StubCommands):
+    """Execute the adapter's actual command against pytest's temporary files."""
+
+    def run(self, command: str, **kwargs: Any) -> Any:
+        completed = subprocess.run(
+            shlex.split(command),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return SimpleNamespace(
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            exit_code=completed.returncode,
+        )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected"),
+    [
+        ("*.py", ["/main.py", "/other/src/test.py", "/src/.hidden.py", "/src/test.py"]),
+        ("/*.py", ["/main.py"]),
+        ("src/*.py", ["/src/.hidden.py", "/src/test.py"]),
+        ("**/test.py", ["/other/src/test.py", "/src/test.py"]),
+        ("{main,src/test}.py", ["/main.py", "/src/test.py"]),
+        ("missing/*.py", []),
+        ("linked/*.py", []),
+        ("*.txt", ["/quote'\t\nfile.txt"]),
+    ],
+)
+def test_glob_executes_matching_in_sandbox(
+    tmp_path: Path, pattern: str, expected: list[str]
+) -> None:
+    for name in (
+        "main.py",
+        "src/test.py",
+        "src/.hidden.py",
+        "other/src/test.py",
+        "quote'\t\nfile.txt",
+    ):
+        file = tmp_path / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("hello")
+    (tmp_path / "linked").symlink_to(tmp_path / "src", target_is_directory=True)
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(commands=LocalCommands()), root_dir=str(tmp_path)
+    )
+    response = backend.glob(pattern)
+    assert response.error is None
+    assert response.truncated is False
+    assert [entry["path"] for entry in response.matches] == expected
+    assert all(
+        entry["size"] == 5 and entry["modified_at"] for entry in response.matches
+    )
+
+
+@pytest.mark.parametrize("count", [3, 4, 20])
+def test_glob_stops_collection_at_match_limit(tmp_path: Path, count: int) -> None:
+    for index in range(count):
+        (tmp_path / f"{index}.py").write_text("hello")
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(commands=LocalCommands()),
+        root_dir=str(tmp_path),
+        limits=SandboxResultLimits(glob_matches=4),
+    )
+    response = backend.glob("*")
+    assert response.error is None
+    assert len(response.matches) == min(count, 4)
+    assert response.truncated is (count > 4)
+
+
+def test_glob_reports_traversal_budget_as_truncated(tmp_path: Path) -> None:
+    (tmp_path / "main.py").write_text("hello")
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(commands=LocalCommands()),
+        root_dir=str(tmp_path),
+    )
+    # Force the real traversal deadline before scanning, without a slow test.
+    backend._default_timeout_seconds = 1e-12  # type: ignore[assignment]
+    response = backend.glob("*")
+    assert response.error is None
+    assert response.matches == []
+    assert response.truncated is True
 
 
 def test_grep_applies_include_glob_and_total_max_count() -> None:
