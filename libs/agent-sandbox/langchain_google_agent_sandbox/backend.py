@@ -516,11 +516,9 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             size = getattr(entry, "size", None)
             if size is not None:
                 info["size"] = int(size)
-            mod_time = getattr(entry, "mod_time", None)
-            if mod_time is not None:
-                info["modified_at"] = datetime.fromtimestamp(
-                    float(mod_time), tz=UTC
-                ).isoformat()
+            modified = getattr(entry, "modified", None)
+            if modified is not None:
+                info["modified_at"] = modified.isoformat()
             entries.append(info)
         entries.sort(key=lambda item: item["path"])
         return LsResult(entries=entries)
@@ -1123,8 +1121,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             except ValueError:
                 pass
             try:
-                metadata["mod_time"] = float(mod_str)
-            except ValueError:
+                metadata["modified"] = datetime.fromtimestamp(float(mod_str), tz=UTC)
+            except (ValueError, OverflowError, OSError):
                 pass
             entries.append(SimpleNamespace(**metadata))
         return entries

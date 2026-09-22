@@ -11,7 +11,7 @@ Looking for the JS/TS version? Check out [LangChain.js](https://github.com/langc
 Kubernetes `k8s-agent-sandbox` runtimes. It lets LangChain agents run tools in
 Kubernetes-native sandboxes while keeping the package itself importable without
 a Kubernetes cluster. It implements the DeepAgents 0.7 backend protocols and
-requires `deepagents>=0.7.4` and `k8s-agent-sandbox==0.5.4`.
+requires `deepagents>=0.7.4` and `k8s-agent-sandbox==1.0.3`.
 
 ## What this package is, and is not
 

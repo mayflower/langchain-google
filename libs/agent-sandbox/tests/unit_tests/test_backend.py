@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,7 @@ import pytest
 from deepagents.backends.protocol import DeleteResult
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from k8s_agent_sandbox.exceptions import SandboxNotFoundError
+from k8s_agent_sandbox.models import FileEntry as SDKFileEntry
 
 from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
@@ -38,7 +40,9 @@ class FileEntry:
         self.name = name
         self.type = type
         self.size = size
-        self.mod_time = mod_time
+        self.modified = (
+            datetime.fromtimestamp(mod_time, tz=UTC) if mod_time is not None else None
+        )
 
 
 class StubCommands:
@@ -244,6 +248,23 @@ def test_ls_sorts_filters_and_maps_metadata() -> None:
     assert "2023" in response.entries[1]["modified_at"]
 
 
+def test_ls_preserves_official_sdk_legacy_runtime_timestamp() -> None:
+    entry = SDKFileEntry.from_legacy(
+        {
+            "name": "report.csv",
+            "size": 4,
+            "type": "file",
+            "mod_time": 1_700_000_000,
+        }
+    )
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(files=StubFiles(entries=[entry]))
+    )
+    result = backend.ls("/")
+    assert result.error is None
+    assert result.entries[0]["modified_at"] == "2023-11-14T22:13:20+00:00"
+
+
 def test_ls_uses_shell_fallback_outside_runtime_root() -> None:
     stdout = (
         "d\t64\t1700000000\tchild-dir\x00"
@@ -267,6 +288,7 @@ def test_ls_uses_shell_fallback_outside_runtime_root() -> None:
     ]
     assert response.entries[0]["is_dir"] is True
     assert response.entries[1]["size"] == 5
+    assert response.entries[1]["modified_at"] == "2023-11-14T22:13:21+00:00"
     assert "find -L /tmp" in commands.calls[0][0]
 
 

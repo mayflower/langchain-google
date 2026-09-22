@@ -124,7 +124,7 @@ def test_guard_rejects_a_lockfile_resolving_from_git(
 ) -> None:
     path = tmp_path / "uv.lock"
     path.write_text(
-        '[[package]]\nname = "k8s-agent-sandbox"\nversion = "0.5.4"\n'
+        '[[package]]\nname = "k8s-agent-sandbox"\nversion = "1.0.3"\n'
         '[package.source]\ngit = "https://example.invalid/fork.git"\n'
     )
     with pytest.raises(guard.ProvenanceError, match="registry source"):

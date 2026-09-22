@@ -32,7 +32,7 @@ from importlib import metadata
 from pathlib import Path
 
 EXPECTED_NAME = "k8s-agent-sandbox"
-EXPECTED_VERSION = "0.5.4"
+EXPECTED_VERSION = "1.0.3"
 EXPECTED_PIN = f"{EXPECTED_NAME}=={EXPECTED_VERSION}"
 
 #: Coordinates of the retired Mayflower fork. Their reappearance anywhere in
