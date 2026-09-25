@@ -40,8 +40,9 @@ from deepagents.backends.protocol import (
     SandboxBackendProtocol,
     WriteResult,
 )
-from k8s_agent_sandbox.exceptions import SandboxNotFoundError
+from k8s_agent_sandbox.exceptions import SandboxNotFoundError, SandboxRequestError
 
+from langchain_google_agent_sandbox._errors import is_connection_setup_error
 from langchain_google_agent_sandbox.backend import AgentSandboxBackend
 from langchain_google_agent_sandbox.limits import SandboxResultLimits
 from langchain_google_agent_sandbox.provider import SandboxLease, SandboxSessionProvider
@@ -338,6 +339,14 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
             raise RuntimeError(msg)
         with self._cache_lock:
             entry = self._entries.get(session_key)
+        if (
+            entry is not None
+            and self._local_cache_ttl_seconds is not None
+            and time.monotonic() - entry.last_accessed_at
+            >= self._local_cache_ttl_seconds
+        ):
+            self._invalidate(session_key)
+            entry = None
         if entry is not None:
             now = time.monotonic()
             entry.last_accessed_at = now
@@ -385,7 +394,11 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
             entry = self._entry_locked(session_key, config)
             try:
                 return getattr(entry.backend, method_name)(*args, **kwargs)
-            except SandboxNotFoundError:
+            except (SandboxNotFoundError, SandboxRequestError) as error:
+                if isinstance(
+                    error, SandboxRequestError
+                ) and not is_connection_setup_error(error):
+                    raise
                 # The sandbox vanished under a cached handle. Drop it and
                 # re-acquire exactly once. A second failure is genuine and
                 # propagates rather than starting a retry loop.

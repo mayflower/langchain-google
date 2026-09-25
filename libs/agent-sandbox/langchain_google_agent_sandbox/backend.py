@@ -53,7 +53,10 @@ from deepagents.backends.utils import (
 from k8s_agent_sandbox.exceptions import SandboxNotFoundError
 
 from langchain_google_agent_sandbox import _compat
-from langchain_google_agent_sandbox._errors import is_timeout_exception
+from langchain_google_agent_sandbox._errors import (
+    is_connection_setup_error,
+    is_timeout_exception,
+)
 from langchain_google_agent_sandbox._paths import (
     compile_glob,
     compile_grep_include_glob,
@@ -458,6 +461,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             except SandboxNotFoundError:
                 raise
             except Exception as error:
+                if is_connection_setup_error(error):
+                    raise
                 if is_timeout_exception(error):
                     return ExecuteResponse(
                         output=f"Timed out: {error}",

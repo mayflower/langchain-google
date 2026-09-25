@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import socket
 import threading
 import time
 import weakref
@@ -21,9 +22,13 @@ from deepagents.middleware.skills import SkillsMiddleware
 from k8s_agent_sandbox.exceptions import (
     SandboxClaimFailedError,
     SandboxNotFoundError,
+    SandboxRequestError,
 )
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from urllib3.connection import HTTPConnection
+from urllib3.exceptions import MaxRetryError, NameResolutionError, ReadTimeoutError
 
 from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
@@ -315,6 +320,56 @@ def test_close_local_failure_still_clears_the_cache() -> None:
 
 
 # --- staleness and retry -----------------------------------------------------
+
+
+def test_current_session_expires_before_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    provider = RecordingProvider()
+    backend = make_backend(provider, local_cache_ttl_seconds=300)
+    pinned(backend, "t1")
+    assert backend.execute("echo first").exit_code == 0
+    clock[0] += 301
+    assert backend.execute("echo resumed").exit_code == 0
+    assert provider.acquire_calls == ["t1", "t1"]
+    assert provider.closed_local == ["lease-t1"]
+
+
+@pytest.mark.parametrize("failure", ["dns", "read_timeout", "reset", "http_500"])
+def test_transport_recovery_only_replays_unsent_commands(failure: str) -> None:
+    provider = RecordingProvider()
+    backend = make_backend(provider)
+    pinned(backend, "t1")
+    lease = backend.get_session_lease(config_for("t1"))
+    if failure == "dns":
+        reason = NameResolutionError(
+            "gone", HTTPConnection("gone"), socket.gaierror(-2, "not found")
+        )
+    elif failure == "read_timeout":
+        reason = ReadTimeoutError(None, "/executions", "timed out")
+    else:
+        reason = ConnectionResetError("connection reset")
+    transport = RequestsConnectionError("transport failed")
+    transport.__context__ = MaxRetryError(None, "/executions", reason)
+    error = SandboxRequestError(
+        "communication failed", status_code=500 if failure == "http_500" else None
+    )
+    error.__cause__ = transport
+    lease.sandbox.commands.results = [error, result("recovered")]
+
+    response = backend.execute("side_effect")
+
+    if failure == "dns":
+        assert response.exit_code == 0
+        assert provider.acquire_calls == ["t1", "t1"]
+        assert len(lease.sandbox.commands.calls) == 1
+        replacement = backend.get_session_lease(config_for("t1"))
+        assert replacement.sandbox is not lease.sandbox
+        assert len(replacement.sandbox.commands.calls) == 1
+    else:
+        assert response.exit_code != 0
+        assert provider.acquire_calls == ["t1"]
+        assert len(lease.sandbox.commands.calls) == 1
 
 
 def test_missing_sandbox_triggers_exactly_one_reacquire() -> None:

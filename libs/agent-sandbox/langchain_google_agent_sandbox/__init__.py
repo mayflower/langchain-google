@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from importlib import metadata
 
+from langchain_google_agent_sandbox._errors import is_connection_setup_error
 from langchain_google_agent_sandbox.backend import AgentSandboxBackend
 from langchain_google_agent_sandbox.factory import (
     create_sandbox_backend,
@@ -36,4 +37,5 @@ __all__ = [
     "create_sandbox_backend",
     "create_sandbox_backend_factory",
     "default_session_resolver",
+    "is_connection_setup_error",
 ]

@@ -14,6 +14,28 @@
 
 from __future__ import annotations
 
+from k8s_agent_sandbox.exceptions import SandboxRequestError
+from urllib3.exceptions import MaxRetryError, NewConnectionError
+
+
+def is_connection_setup_error(exc: BaseException) -> bool:
+    """Identify SDK failures before a connection could send the command."""
+    if not isinstance(exc, SandboxRequestError) or exc.status_code is not None:
+        return False
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, NewConnectionError):
+            return True
+        current = (
+            current.reason
+            if isinstance(current, MaxRetryError)
+            else current.__cause__ or current.__context__
+        )
+    return False
+
+
 try:
     from requests.exceptions import Timeout as _RequestsTimeout
 except ImportError:  # pragma: no cover - optional transport
