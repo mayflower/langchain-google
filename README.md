@@ -7,6 +7,7 @@ This repository centralizes Google integrations for [LangChain](https://github.c
 - [`langchain-google-genai`](https://pypi.org/project/langchain-google-genai/) implements integrations of Google [Generative AI](https://ai.google.dev/) (Gemini API) models.
 - [`langchain-google-vertexai`](https://pypi.org/project/langchain-google-vertexai/) implements integrations of Google Cloud [Generative AI on Vertex AI](https://cloud.google.com/vertex-ai/docs/generative-ai/learn/overview)
 - [`langchain-google-community`](https://pypi.org/project/langchain-google-community/) implements integrations for Google products that are not part of the above two packages
+- [`langchain-google-agent-sandbox`](https://pypi.org/project/langchain-google-agent-sandbox/) provides a DeepAgents backend for Kubernetes `k8s-agent-sandbox` runtimes.
 
 See the [Google provider page](https://docs.langchain.com/oss/python/integrations/providers/google) in the LangChain Docs for more details.
 

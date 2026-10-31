@@ -4,7 +4,8 @@ import sys
 LANGCHAIN_DIRS = {
     "libs/genai",
     "libs/vertexai",
-    "libs/community"
+    "libs/community",
+    "libs/agent-sandbox",
 }
 
 if __name__ == "__main__":
@@ -32,6 +33,8 @@ if __name__ == "__main__":
             dirs_to_run.update({"libs/vertexai"})
         elif "libs/community" in file:
             dirs_to_run.update({"libs/community"})
+        elif "libs/agent-sandbox" in file:
+            dirs_to_run.update({"libs/agent-sandbox"})
         else:
             pass
     json_output = json.dumps(list(dirs_to_run))
