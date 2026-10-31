@@ -750,6 +750,7 @@ async def test_sync_and_async_deepagents_delegation() -> None:
     concrete.download_files.return_value = []
     backend._entries["delegation"] = _SessionEntry(
         backend=concrete,
+        sandbox_backend=concrete,
         lease=entry.lease,
         last_accessed_at=entry.last_accessed_at,
         last_touched_at=entry.last_touched_at,
@@ -777,10 +778,24 @@ async def test_sync_and_async_deepagents_delegation() -> None:
     await backend.aupload_files([])
     await backend.adownload_files([])
 
-    assert concrete.execute.call_count == 2
-    assert concrete.download_files.call_count == 2
-    assert concrete.grep.call_args_list[0].kwargs == {"max_count": 7}
-    assert concrete.grep.call_args_list[1].kwargs == {"max_count": 3}
+    # Each call reaches the backend's own method of the same kind: an async
+    # call must not degrade to the synchronous one in a worker thread.
+    for name in (
+        "execute",
+        "ls",
+        "read",
+        "write",
+        "edit",
+        "delete",
+        "grep",
+        "glob",
+        "upload_files",
+        "download_files",
+    ):
+        assert getattr(concrete, name).call_count == 1, name
+        assert getattr(concrete, f"a{name}").await_count == 1, f"a{name}"
+    assert concrete.grep.call_args.kwargs == {"max_count": 7}
+    assert concrete.agrep.await_args.kwargs == {"max_count": 3}
 
 
 def test_current_deepagents_graph_invocation_uses_session_backend() -> None:
@@ -814,3 +829,111 @@ def test_current_deepagents_graph_invocation_uses_session_backend() -> None:
     assert provider.sandboxes["deepagents-current"].files.write_calls == [
         ("deepagents.txt", b"ok"),
     ]
+
+
+class _Recorded(SandboxBackendProtocol):
+    """A wrapper that records which concrete backend served each operation."""
+
+    def __init__(self, inner: AgentSandboxBackend, log: list[tuple[str, Any]]) -> None:
+        self.inner = inner
+        self.log = log
+
+    def execute(self, command: str, *, timeout: int | None = None) -> Any:
+        self.log.append(("execute", self.inner))
+        return self.inner.execute(command, timeout=timeout)
+
+    async def aexecute(self, command: str, *, timeout: int | None = None) -> Any:
+        self.log.append(("aexecute", self.inner))
+        return self.inner.execute(command, timeout=timeout)
+
+    @property
+    def id(self) -> str:
+        return self.inner.id
+
+
+def test_backend_wrapper_serves_every_operation_including_the_retried_one() -> None:
+    log: list[tuple[str, Any]] = []
+    provider = RecordingProvider()
+    backend = make_backend(
+        provider, backend_wrapper=lambda inner: _Recorded(inner, log)
+    )
+    pinned(backend, "t1")
+    first = backend._entry(config_for("t1"))
+    calls: list[str] = []
+
+    def fail_once(command: str, **kwargs: Any) -> Any:
+        calls.append(command)
+        if len(calls) == 1:
+            raise SandboxNotFoundError("gone")
+        return result("ok")
+
+    first.lease.sandbox.commands.run = fail_once  # type: ignore[method-assign]
+
+    assert backend.execute("echo hi").exit_code == 0
+
+    assert [name for name, _ in log] == ["execute", "execute"]
+    assert all(type(inner) is AgentSandboxBackend for _, inner in log)
+    assert log[0][1] is not log[1][1]
+    assert provider.acquire_calls == ["t1", "t1"]
+
+
+async def test_async_operations_reattach_exactly_once_through_the_wrapper() -> None:
+    log: list[tuple[str, Any]] = []
+    provider = RecordingProvider()
+    backend = make_backend(
+        provider, backend_wrapper=lambda inner: _Recorded(inner, log)
+    )
+    pinned(backend, "t1")
+    first = backend._entry(config_for("t1"))
+    calls: list[str] = []
+
+    def fail_once(command: str, **kwargs: Any) -> Any:
+        calls.append(command)
+        if len(calls) == 1:
+            raise SandboxNotFoundError("gone")
+        return result("ok")
+
+    first.lease.sandbox.commands.run = fail_once  # type: ignore[method-assign]
+
+    assert (await backend.aexecute("echo hi")).exit_code == 0
+
+    assert [name for name, _ in log] == ["aexecute", "aexecute"]
+    assert provider.acquire_calls == ["t1", "t1"]
+
+
+async def test_a_second_async_failure_propagates_without_a_retry_loop() -> None:
+    def always_missing(command: str, **kwargs: Any) -> Any:
+        raise SandboxNotFoundError("gone")
+
+    class AlwaysMissingProvider(RecordingProvider):
+        def acquire(self, config: Mapping[str, Any]) -> SandboxLease:
+            lease = super().acquire(config)
+            lease.sandbox.commands.run = always_missing  # type: ignore[method-assign]
+            return lease
+
+    provider = AlwaysMissingProvider()
+    backend = make_backend(provider)
+    pinned(backend, "t1")
+
+    with pytest.raises(SandboxNotFoundError):
+        await backend.aexecute("echo hi")
+    assert provider.acquire_calls == ["t1", "t1"]
+
+
+def test_releasing_a_wrapped_session_closes_its_concrete_backend() -> None:
+    closed: list[AgentSandboxBackend] = []
+
+    class Closing(AgentSandboxBackend):
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+    provider = RecordingProvider()
+    backend = make_backend(provider, backend_wrapper=lambda inner: _Recorded(inner, []))
+    backend._wrap = Closing.from_existing  # type: ignore[method-assign]
+    entry = backend._entry(config_for("t1"))
+
+    backend.close_session(config_for("t1"))
+
+    assert closed == [entry.sandbox_backend]
+    assert provider.closed_local == ["lease-t1"]

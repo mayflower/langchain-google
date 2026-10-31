@@ -48,10 +48,14 @@ from langchain_google_agent_sandbox.limits import SandboxResultLimits
 from langchain_google_agent_sandbox.provider import SandboxLease, SandboxSessionProvider
 
 SessionResolver = Callable[[Mapping[str, Any]], str]
+#: Builds the backend a session's operations run through from the concrete
+#: backend of its lease, e.g. to add product policy around every lease.
+BackendWrapper = Callable[[AgentSandboxBackend], SandboxBackendProtocol]
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "BackendWrapper",
     "ProviderSessionAgentSandboxBackend",
     "SessionAgentSandboxBackend",
     "default_session_resolver",
@@ -87,9 +91,14 @@ def default_session_resolver(config: Mapping[str, Any]) -> str:
 
 @dataclass
 class _SessionEntry:
-    """One process-local cached session."""
+    """One process-local cached session.
 
-    backend: AgentSandboxBackend
+    ``backend`` serves the session's operations; ``sandbox_backend`` is the
+    concrete backend of the lease underneath it, which owns the connection.
+    """
+
+    backend: SandboxBackendProtocol
+    sandbox_backend: AgentSandboxBackend
     lease: SandboxLease
     last_accessed_at: float
     last_touched_at: float
@@ -98,7 +107,7 @@ class _SessionEntry:
 def _release_entry(provider: SandboxSessionProvider, entry: _SessionEntry) -> None:
     """Release local resources for one entry. Never touches remote state."""
     try:
-        entry.backend.close()
+        entry.sandbox_backend.close()
     finally:
         try:
             provider.close_local(entry.lease)
@@ -158,7 +167,17 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
         max_cached_sessions: int = 128,
         touch_interval_seconds: float = 60.0,
         limits: SandboxResultLimits | None = None,
+        backend_wrapper: BackendWrapper | None = None,
     ) -> None:
+        """Create the session backend.
+
+        Args:
+            backend_wrapper: Builds the backend each lease's operations run
+                through from the lease's concrete :class:`AgentSandboxBackend`.
+                Every operation, synchronous or asynchronous and including the
+                one retried after reattachment, goes through it. Defaults to
+                the concrete backend itself.
+        """
         if provider is None:
             msg = "provider is required; see SandboxSessionProvider"
             raise ValueError(msg)
@@ -188,6 +207,7 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
         self._max_cached_sessions = max_cached_sessions
         self._touch_interval_seconds = float(touch_interval_seconds)
         self._limits = limits
+        self._backend_wrapper = backend_wrapper
         self._entries: dict[str, _SessionEntry] = {}
         # Reverse index enforcing that one lease never backs two session keys.
         self._lease_owners: dict[str, str] = {}
@@ -237,6 +257,7 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
             return self._session_locks.setdefault(session_key, threading.RLock())
 
     def _wrap(self, sandbox: Any) -> AgentSandboxBackend:
+        """The concrete backend for one lease's sandbox."""
         return AgentSandboxBackend.from_existing(
             sandbox,
             root_dir=self._root_dir,
@@ -261,8 +282,15 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
             )
             raise TypeError(msg)
         now = time.monotonic()
+        sandbox_backend = self._wrap(lease.sandbox)
+        backend = (
+            sandbox_backend
+            if self._backend_wrapper is None
+            else self._backend_wrapper(sandbox_backend)
+        )
         return _SessionEntry(
-            backend=self._wrap(lease.sandbox),
+            backend=backend,
+            sandbox_backend=sandbox_backend,
             lease=lease,
             last_accessed_at=now,
             last_touched_at=now,
@@ -411,6 +439,45 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
                 replacement = self._entry_locked(session_key, config)
                 return getattr(replacement.backend, method_name)(*args, **kwargs)
 
+    def _replace_entry(
+        self, session_key: str, config: Mapping[str, Any], stale: _SessionEntry
+    ) -> _SessionEntry:
+        """Drop ``stale`` unless another caller already replaced it."""
+        with self._lock_for(session_key):
+            with self._cache_lock:
+                current = self._entries.get(session_key)
+            if current is stale:
+                self._invalidate(session_key)
+            return self._entry_locked(session_key, config)
+
+    async def _ainvoke(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        """Run the session backend's async ``method_name``.
+
+        The per-session lock is a thread lock, so it guards only the cache
+        lookup (in a worker thread), never the awaited operation. Reattachment
+        follows :meth:`_invoke`: one re-acquire after a stale handle, and
+        a second failure propagates.
+        """
+        session_key, config = self._resolve()
+
+        def entry() -> _SessionEntry:
+            self._evict_idle_entries(exclude=session_key)
+            with self._lock_for(session_key):
+                return self._entry_locked(session_key, config)
+
+        current = await asyncio.to_thread(entry)
+        try:
+            return await getattr(current.backend, method_name)(*args, **kwargs)
+        except (SandboxNotFoundError, SandboxRequestError) as error:
+            if isinstance(error, SandboxRequestError) and not is_connection_setup_error(
+                error
+            ):
+                raise
+            replacement = await asyncio.to_thread(
+                self._replace_entry, session_key, config, current
+            )
+            return await getattr(replacement.backend, method_name)(*args, **kwargs)
+
     def get_session_lease(
         self, config: Mapping[str, Any] | None = None
     ) -> SandboxLease:
@@ -471,7 +538,7 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
 
     async def adelete(self, file_path: str) -> DeleteResult:
         """Async version of :meth:`delete`."""
-        return await asyncio.to_thread(self.delete, file_path)
+        return await self._ainvoke("adelete", file_path)
 
     def grep(
         self,
@@ -493,6 +560,54 @@ class ProviderSessionAgentSandboxBackend(SandboxBackendProtocol):
 
     def download_files(self, paths: Iterable[str]) -> list[FileDownloadResponse]:
         return self._invoke("download_files", paths)
+
+    async def aexecute(
+        self, command: str, *, timeout: int | None = None
+    ) -> ExecuteResponse:
+        return await self._ainvoke("aexecute", command, timeout=timeout)
+
+    async def als(self, path: str) -> LsResult:
+        return await self._ainvoke("als", path)
+
+    async def aread(
+        self, file_path: str, offset: int = 0, limit: int = 2000
+    ) -> ReadResult:
+        return await self._ainvoke("aread", file_path, offset, limit)
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        return await self._ainvoke("awrite", file_path, content)
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        return await self._ainvoke(
+            "aedit", file_path, old_string, new_string, replace_all
+        )
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        *,
+        max_count: int | None = None,
+    ) -> GrepResult:
+        return await self._ainvoke("agrep", pattern, path, glob, max_count=max_count)
+
+    async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
+        return await self._ainvoke("aglob", pattern, path)
+
+    async def aupload_files(
+        self, files: list[tuple[str, bytes]]
+    ) -> list[FileUploadResponse]:
+        return await self._ainvoke("aupload_files", files)
+
+    async def adownload_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        return await self._ainvoke("adownload_files", paths)
 
 
 #: Arguments the pre-provider backend accepted, mapped to their replacement.

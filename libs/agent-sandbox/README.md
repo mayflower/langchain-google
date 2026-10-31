@@ -84,8 +84,10 @@ with AgentSandboxBackend.from_warm_pool(
 ```python
 from langchain_google_agent_sandbox import (
     AgentSandboxBackend,
+    BackendWrapper,
     ProviderSessionAgentSandboxBackend,
     SandboxLease,
+    SandboxPaths,
     SandboxPolicyWrapper,
     SandboxResultLimits,
     SandboxSessionProvider,
@@ -204,7 +206,10 @@ agent.invoke(
   never called once per file operation, and a failure is logged without failing
   the agent's operation.
 - On `SandboxNotFoundError` the stale lease is dropped and re-acquired **exactly
-  once**. A second failure propagates; there is no retry loop.
+  once**. A second failure propagates; there is no retry loop. This holds for
+  synchronous and asynchronous operations alike.
+- An asynchronous operation runs the session backend's own asynchronous method;
+  it never degrades to the synchronous one in a worker thread.
 - `SandboxClaimFailedError` is terminal. It reports a `Ready=False` reason the
   controller will not retry, so it propagates without a re-acquire.
 - Eviction (`local_cache_ttl_seconds`, `max_cached_sessions`) and `close()` call
@@ -328,6 +333,34 @@ wrapped = SandboxPolicyWrapper(
 
 Real isolation comes from the sandbox runtime, container isolation, Kubernetes
 policy, and node configuration. Lexical path checks do not resolve symlinks.
+
+## Extending the Backend
+
+Add behavior by composition, not by overriding private methods.
+
+`ProviderSessionAgentSandboxBackend(..., backend_wrapper=...)` takes a callable
+that receives each lease's concrete `AgentSandboxBackend` and returns the
+`SandboxBackendProtocol` the session's operations run through. Every operation,
+synchronous or asynchronous and including the one retried after a re-acquire,
+goes through it. Closing a session still closes the concrete backend.
+
+```python
+backend = ProviderSessionAgentSandboxBackend(
+    provider,
+    backend_wrapper=lambda concrete: MyPolicyBackend(concrete),
+)
+```
+
+Code that calls sandbox runtime endpoints this package does not wrap, such as
+streaming transfers, uses the concrete backend's public runtime surface:
+
+- `backend.sandbox`: the attached SDK sandbox.
+- `backend.paths`: a `SandboxPaths` mapping public paths to internal and
+  runtime-relative ones, so direct calls address the same files.
+- `backend.operation()`: a context manager that counts a direct call as in
+  flight, so shutdown waits for it.
+- `backend.write_target_state(path)`: whether a write would create
+  (`"missing"`) or replace (`"file"`), for create-versus-edit policy.
 
 ## Connection Modes
 

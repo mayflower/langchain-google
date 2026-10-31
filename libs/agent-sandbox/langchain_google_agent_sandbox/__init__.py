@@ -9,12 +9,14 @@ from langchain_google_agent_sandbox.factory import (
     create_sandbox_backend_factory,
 )
 from langchain_google_agent_sandbox.limits import SandboxResultLimits
+from langchain_google_agent_sandbox.paths import SandboxPaths
 from langchain_google_agent_sandbox.policy import SandboxPolicyWrapper
 from langchain_google_agent_sandbox.provider import (
     SandboxLease,
     SandboxSessionProvider,
 )
 from langchain_google_agent_sandbox.session_backend import (
+    BackendWrapper,
     ProviderSessionAgentSandboxBackend,
     SessionAgentSandboxBackend,
     default_session_resolver,
@@ -27,8 +29,10 @@ except metadata.PackageNotFoundError:
 
 __all__ = [
     "AgentSandboxBackend",
+    "BackendWrapper",
     "ProviderSessionAgentSandboxBackend",
     "SandboxLease",
+    "SandboxPaths",
     "SandboxPolicyWrapper",
     "SandboxResultLimits",
     "SandboxSessionProvider",

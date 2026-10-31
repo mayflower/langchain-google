@@ -50,7 +50,7 @@ from deepagents.backends.utils import (
     check_empty_content,
     normalize_read_bounds,
 )
-from k8s_agent_sandbox.exceptions import SandboxNotFoundError
+from k8s_agent_sandbox.exceptions import SandboxNotFoundError, SandboxRequestError
 
 from langchain_google_agent_sandbox import _compat
 from langchain_google_agent_sandbox._errors import (
@@ -61,9 +61,9 @@ from langchain_google_agent_sandbox._paths import (
     compile_glob,
     compile_grep_include_glob,
     glob_regexes,
-    reject_control_chars,
 )
 from langchain_google_agent_sandbox.limits import DEFAULT_LIMITS, SandboxResultLimits
+from langchain_google_agent_sandbox.paths import SandboxPaths
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +186,11 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         self._labels = _labels
         self._shutdown_after_seconds = _shutdown_after_seconds
         self._default_timeout_seconds = _default_timeout_seconds
+        self._paths = SandboxPaths(
+            root_dir=self._root_dir,
+            runtime_root=self._runtime_root,
+            allow_absolute_paths=allow_absolute_paths,
+        )
         self._draining = False
         self._inflight = 0
         self._inflight_cv = threading.Condition(threading.Lock())
@@ -443,6 +448,47 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             raise RuntimeError(msg)
         return self._sandbox
 
+    # Public surface for code that talks to the sandbox runtime directly, for
+    # example to stream files or call runtime endpoints this backend does not
+    # wrap. It addresses the same sandbox and files as the backend and takes
+    # part in its shutdown.
+
+    @property
+    def paths(self) -> SandboxPaths:
+        """How this backend maps public, internal and runtime-relative paths."""
+        return self._paths
+
+    @property
+    def sandbox(self) -> Any:
+        """The attached SDK sandbox.
+
+        Raises:
+            RuntimeError: If the backend has not been entered.
+        """
+        return self._assert_sandbox()
+
+    @contextmanager
+    def operation(self) -> Iterator[None]:
+        """Count a direct runtime call as in flight.
+
+        Shutdown waits for it like for the backend's own operations, and a
+        call started while the backend is shutting down is refused.
+        """
+        with self._track_op():
+            yield
+
+    def write_target_state(self, path: str) -> str:
+        """Whether a write to the public ``path`` would create or replace.
+
+        Returns ``"missing"``, ``"file"``, ``"dir"``, ``"denied"`` or
+        ``"error"`` for the internal path the write targets.
+
+        Raises:
+            ValueError: If ``path`` is empty, malformed or escapes the root.
+        """
+        with self._track_op():
+            return self._file_state(self._resolve_write_path(path))
+
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """Execute a shell command with ``root_dir`` as the working directory."""
         sandbox = self._assert_sandbox()
@@ -546,6 +592,11 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 content = self._read_bytes_at(internal_path)
             except SandboxNotFoundError:
                 raise
+            except SandboxRequestError as error:
+                if error.status_code == 404:
+                    # DeepAgents' own backends word a missing file this way.
+                    return ReadResult(error=f"File '{file_path}' not found")
+                return ReadResult(error=f"Failed to read '{file_path}': {error}")
             except Exception as error:
                 return ReadResult(error=f"Failed to read '{file_path}': {error}")
         if _get_backend_read_file_type(file_path) != "text":
@@ -980,10 +1031,17 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                     continue
                 try:
                     content = self._read_bytes_at(internal_path)
-                except Exception:
+                except Exception as error:
+                    # The file can vanish between the state probe and the read.
+                    missing = (
+                        isinstance(error, SandboxRequestError)
+                        and error.status_code == 404
+                    )
                     responses.append(
                         FileDownloadResponse(
-                            path=path, content=None, error="download_failed"
+                            path=path,
+                            content=None,
+                            error="file_not_found" if missing else "download_failed",
                         )
                     )
                     continue
@@ -1016,66 +1074,16 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             raise RuntimeError(msg)
 
     def _resolve_write_path(self, path: str) -> str:
-        candidate = path.strip()
-        if not candidate:
-            msg = "empty path"
-            raise ValueError(msg)
-        reject_control_chars(candidate)
-        normalized = posixpath.normpath(candidate)
-        if (
-            self._allow_absolute_paths
-            and normalized.startswith("/")
-            and normalized != self._root_dir
-            and not normalized.startswith(self._root_dir + "/")
-        ):
-            return normalized
-        return self._to_internal(candidate)
+        return self._paths.write_target(path)
 
     def _to_internal(self, path: str) -> str:
-        stripped = path.strip() or "/"
-        reject_control_chars(stripped)
-        normalized = posixpath.normpath(stripped)
-        if (
-            self._allow_absolute_paths
-            and normalized.startswith("/")
-            and normalized != "/"
-        ):
-            if normalized == self._runtime_root or normalized.startswith(
-                self._runtime_root + "/"
-            ):
-                internal_path = normalized
-            else:
-                internal_path = posixpath.normpath(
-                    posixpath.join(self._runtime_root, normalized.lstrip("/"))
-                )
-            self._to_runtime_relative(internal_path)
-            return internal_path
-        if normalized == self._root_dir or normalized.startswith(self._root_dir + "/"):
-            normalized = normalized[len(self._root_dir) :]
-        normalized = normalized.lstrip("/")
-        internal_path = posixpath.normpath(posixpath.join(self._root_dir, normalized))
-        rel = posixpath.relpath(internal_path, self._root_dir)
-        if rel == ".." or rel.startswith("../"):
-            msg = f"Path '{path}' escapes root_dir '{self._root_dir}'"
-            raise ValueError(msg)
-        return internal_path
+        return self._paths.to_internal(path)
 
     def _to_runtime_relative(self, internal_path: str) -> str:
-        rel = posixpath.relpath(internal_path, self._runtime_root)
-        if rel == ".." or rel.startswith("../"):
-            msg = (
-                f"Internal path '{internal_path}' is outside runtime_root "
-                f"'{self._runtime_root}'"
-            )
-            raise ValueError(msg)
-        return "." if rel == "." else rel
+        return self._paths.to_runtime_relative(internal_path)
 
     def _to_public(self, internal_path: str) -> str:
-        rel = posixpath.relpath(internal_path, self._root_dir)
-        if self._allow_absolute_paths and (rel == ".." or rel.startswith("../")):
-            self._to_runtime_relative(internal_path)
-            return internal_path
-        return "/" if rel == "." else "/" + rel
+        return self._paths.to_public(internal_path)
 
     def _normalize_public_dir(self, path: str) -> str:
         if not path or path == "/":

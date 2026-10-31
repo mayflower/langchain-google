@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 from deepagents.backends.protocol import DeleteResult
 from deepagents.middleware.filesystem import FilesystemMiddleware
-from k8s_agent_sandbox.exceptions import SandboxNotFoundError
+from k8s_agent_sandbox.exceptions import SandboxNotFoundError, SandboxRequestError
 from k8s_agent_sandbox.models import FileEntry as SDKFileEntry
 
 from langchain_google_agent_sandbox import (
@@ -875,3 +875,78 @@ def test_factory_creates_its_own_ephemeral_claim() -> None:
     assert client.listed == []
     backend.__exit__(None, None, None)
     assert client.deleted == [("claim-1", "ns")]
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [
+        (404, "File '/missing.txt' not found"),
+        (500, "Failed to read '/missing.txt': runtime failed"),
+        (None, "Failed to read '/missing.txt': runtime failed"),
+    ],
+)
+def test_read_reports_a_missing_file_like_deepagents(
+    status: int | None, error: str
+) -> None:
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(
+            files=StubFiles(
+                read=SandboxRequestError("runtime failed", status_code=status)
+            )
+        )
+    )
+
+    assert backend.read("/missing.txt").error == error
+
+
+def test_download_reports_a_file_removed_after_the_state_probe_as_missing() -> None:
+    files = StubFiles(read=SandboxRequestError("gone", status_code=404))
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(commands=StubCommands([result("file")]), files=files)
+    )
+
+    (response,) = backend.download_files(["/x.txt"])
+
+    assert response.error == "file_not_found"
+
+
+def test_runtime_surface_addresses_the_backends_sandbox_and_paths() -> None:
+    sandbox = StubSandbox()
+    backend = AgentSandboxBackend.from_existing(
+        sandbox, root_dir="/workspace/project", runtime_root="/workspace"
+    )
+
+    assert backend.sandbox is sandbox
+    internal = backend.paths.to_internal("/notes/a.md")
+    assert internal == "/workspace/project/notes/a.md"
+    assert backend.paths.to_runtime_relative(internal) == "project/notes/a.md"
+    assert backend.paths.to_public(internal) == "/notes/a.md"
+    with pytest.raises(ValueError, match="escapes root_dir"):
+        backend.paths.to_internal("../etc/passwd")
+
+
+def test_runtime_operations_take_part_in_shutdown() -> None:
+    backend = AgentSandboxBackend.from_existing(StubSandbox())
+    with backend.operation():
+        assert backend._inflight == 1
+    assert backend._inflight == 0
+
+    backend._draining = True
+    with pytest.raises(RuntimeError, match="shutting down"), backend.operation():
+        pass
+
+
+@pytest.mark.parametrize("state", ["missing", "file", "dir", "denied"])
+def test_write_target_state_probes_the_write_target(state: str) -> None:
+    commands = StubCommands([result(state)])
+    backend = AgentSandboxBackend.from_existing(StubSandbox(commands=commands))
+
+    assert backend.write_target_state("/reports/q3.md") == state
+    ((command, _),) = commands.calls
+    assert "/workspace/reports/q3.md" in command
+
+
+def test_unattached_backend_has_no_sandbox() -> None:
+    backend = AgentSandboxBackend(sandbox=None)
+    with pytest.raises(RuntimeError, match="not initialized"):
+        _ = backend.sandbox
