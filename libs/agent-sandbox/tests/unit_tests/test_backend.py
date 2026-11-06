@@ -950,3 +950,67 @@ def test_unattached_backend_has_no_sandbox() -> None:
     backend = AgentSandboxBackend(sandbox=None)
     with pytest.raises(RuntimeError, match="not initialized"):
         _ = backend.sandbox
+
+
+def busy(retry_after: str | None = "1") -> SandboxRequestError:
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    return SandboxRequestError(
+        "Failed to communicate with the sandbox at http://runtime/execute.",
+        status_code=409,
+        response=SimpleNamespace(headers=headers),
+    )
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Sleeps advance a fake clock instead of the test."""
+    from langchain_google_agent_sandbox import backend as backend_module
+
+    now = [0.0]
+    monkeypatch.setattr(backend_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        backend_module.time,
+        "sleep",
+        lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+    return now
+
+
+def test_a_busy_runtime_is_waited_out_within_the_timeout(clock: list[float]) -> None:
+    commands = StubCommands([busy(), busy(), result("ok")])
+    backend = AgentSandboxBackend.from_existing(StubSandbox(commands=commands))
+
+    response = backend.execute("echo ok", timeout=30)
+
+    assert (response.output, response.exit_code) == ("ok", 0)
+    assert [kwargs["timeout"] for _, kwargs in commands.calls] == [30, 29, 28]
+    assert clock[0] == 2
+
+
+def test_a_file_operation_waits_out_a_busy_runtime(clock: list[float]) -> None:
+    commands = StubCommands([busy(), result("missing"), result(), result()])
+    backend = AgentSandboxBackend.from_existing(StubSandbox(commands=commands))
+
+    assert backend.write("/notes.txt", "hello").error is None
+    assert clock[0] == 1
+
+
+def test_a_runtime_still_busy_at_the_timeout_fails_the_command(
+    clock: list[float],
+) -> None:
+    commands = StubCommands([busy() for _ in range(10)])
+    backend = AgentSandboxBackend.from_existing(StubSandbox(commands=commands))
+
+    response = backend.execute("echo ok", timeout=3)
+
+    assert response.exit_code == -1
+    assert len(commands.calls) == 3
+    assert clock[0] == 2
+
+
+def test_a_conflict_without_retry_after_is_not_retried(clock: list[float]) -> None:
+    commands = StubCommands([busy(retry_after=None), result("ok")])
+    backend = AgentSandboxBackend.from_existing(StubSandbox(commands=commands))
+
+    assert backend.execute("echo ok", timeout=30).exit_code == -1
+    assert len(commands.calls) == 1

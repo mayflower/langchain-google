@@ -20,6 +20,7 @@ import logging
 import posixpath
 import shlex
 import threading
+import time
 import warnings
 import weakref
 from collections.abc import Iterable, Iterator
@@ -130,6 +131,44 @@ while pending:
 if truncated:
     sys.stdout.write('truncated\\0')
 """
+
+# The SDK's own default for ``commands.run``.
+_SDK_COMMAND_TIMEOUT_SECONDS = 60
+
+
+def _busy_retry_after(error: SandboxRequestError) -> float | None:
+    """The wait a busy runtime asked for, or ``None`` for any other failure.
+
+    A runtime that runs one command at a time answers a concurrent one with
+    ``409 Conflict`` and ``Retry-After``; other conflicts carry no such header.
+    """
+    if error.status_code != 409:
+        return None
+    headers = getattr(error.response, "headers", None) or {}
+    try:
+        return max(float(headers["Retry-After"]), 0.0)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _run_command(sandbox: Any, command: str, **run_kwargs: Any) -> Any:
+    """Run ``command``, waiting while the runtime is busy with another one.
+
+    Parallel tool calls share one runtime, so a file operation can arrive
+    while a command is still running. The wait counts against the command's
+    timeout; once that is spent, the runtime's last answer propagates.
+    """
+    budget = run_kwargs.get("timeout") or _SDK_COMMAND_TIMEOUT_SECONDS
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            return sandbox.commands.run(command, **run_kwargs)
+        except SandboxRequestError as error:
+            wait = _busy_retry_after(error)
+            if wait is None or time.monotonic() + wait >= deadline:
+                raise
+            time.sleep(wait)
+            run_kwargs["timeout"] = max(1, int(deadline - time.monotonic()))
 
 
 class AgentSandboxBackend(SandboxBackendProtocol):
@@ -501,9 +540,9 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             )
             try:
                 if effective_timeout is None:
-                    result = sandbox.commands.run(wrapped)
+                    result = _run_command(sandbox, wrapped)
                 else:
-                    result = sandbox.commands.run(wrapped, timeout=effective_timeout)
+                    result = _run_command(sandbox, wrapped, timeout=effective_timeout)
             except SandboxNotFoundError:
                 raise
             except Exception as error:
@@ -737,8 +776,8 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                     error=f"Cannot delete '{file_path}'",
                 )
             sandbox = self._assert_sandbox()
-            result = sandbox.commands.run(
-                shlex.join(["rm", "-rf", "--", internal_path])
+            result = _run_command(
+                sandbox, shlex.join(["rm", "-rf", "--", internal_path])
             )
             if result.exit_code != 0:
                 detail = result.stderr.strip() or f"exit code {result.exit_code}"
@@ -778,7 +817,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             if self._default_timeout_seconds is not None:
                 run_kwargs["timeout"] = self._default_timeout_seconds
             try:
-                result = sandbox.commands.run(" ".join(parts), **run_kwargs)
+                result = _run_command(sandbox, " ".join(parts), **run_kwargs)
             except SandboxNotFoundError:
                 raise
             except Exception as error:
@@ -887,7 +926,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             )
             command = f"python3 -c {shlex.quote(_GLOB_SCRIPT)} {shlex.quote(arguments)}"
             try:
-                result = sandbox.commands.run(command, timeout=command_timeout)
+                result = _run_command(sandbox, command, timeout=command_timeout)
             except SandboxNotFoundError:
                 raise
             except Exception as error:
@@ -1067,7 +1106,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
     def _ensure_parent_dir(self, internal_path: str) -> None:
         sandbox = self._assert_sandbox()
         parent = posixpath.dirname(internal_path)
-        result = sandbox.commands.run(shlex.join(["mkdir", "-p", parent]))
+        result = _run_command(sandbox, shlex.join(["mkdir", "-p", parent]))
         if result.exit_code != 0:
             detail = result.stderr.strip() or f"exit code {result.exit_code}"
             msg = f"Cannot create parent directory '{parent}': {detail}"
@@ -1109,7 +1148,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         run_kwargs: dict[str, Any] = {}
         if self._default_timeout_seconds is not None:
             run_kwargs["timeout"] = self._default_timeout_seconds
-        result = sandbox.commands.run(command, **run_kwargs)
+        result = _run_command(sandbox, command, **run_kwargs)
         if result.exit_code != 0 and not result.stdout:
             detail = result.stderr.strip() or f"exit code {result.exit_code}"
             msg = f"list '{internal_path}' failed: {detail}"
@@ -1154,7 +1193,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
             f"printf %s {shlex.quote(encoded)} "
             f"| base64 -d > {shlex.quote(internal_path)}"
         )
-        result = sandbox.commands.run(f"sh -c {shlex.quote(pipeline)}")
+        result = _run_command(sandbox, f"sh -c {shlex.quote(pipeline)}")
         if result.exit_code != 0:
             detail = result.stderr.strip() or f"exit code {result.exit_code}"
             msg = f"Write to '{internal_path}' failed: {detail}"
@@ -1169,7 +1208,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
         if runtime_rel is not None:
             return _compat.normalize_read_bytes(sandbox.files.read(runtime_rel))
         command = f"sh -c {shlex.quote(f'base64 < {shlex.quote(internal_path)}')}"
-        result = sandbox.commands.run(command)
+        result = _run_command(sandbox, command)
         if result.exit_code != 0:
             detail = result.stderr.strip() or f"exit code {result.exit_code}"
             msg = f"Read from '{internal_path}' failed: {detail}"
@@ -1181,7 +1220,7 @@ class AgentSandboxBackend(SandboxBackendProtocol):
 
     def _probe_state(self, check_script: str, valid: frozenset[str], label: str) -> str:
         sandbox = self._assert_sandbox()
-        result = sandbox.commands.run(f"sh -c {shlex.quote(check_script)}")
+        result = _run_command(sandbox, f"sh -c {shlex.quote(check_script)}")
         output = result.stdout.strip()
         if not output and result.exit_code != 0:
             logger.warning(
