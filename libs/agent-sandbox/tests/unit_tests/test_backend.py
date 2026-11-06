@@ -1014,3 +1014,17 @@ def test_a_conflict_without_retry_after_is_not_retried(clock: list[float]) -> No
 
     assert backend.execute("echo ok", timeout=30).exit_code == -1
     assert len(commands.calls) == 1
+
+
+@pytest.mark.parametrize(("default_timeout", "sent"), [(300, 30), (None, 30), (12, 12)])
+def test_grep_ends_before_deepagents_abandons_it(
+    default_timeout: int | None, sent: int
+) -> None:
+    """A request DeepAgents gives up on must still end, so the runtime stops it."""
+    commands = StubCommands([result("/workspace/a.txt\x001:hit\n")])
+    backend = AgentSandboxBackend.from_existing(
+        StubSandbox(commands=commands), default_timeout_seconds=default_timeout
+    )
+
+    assert backend.grep("hit", path="/").matches
+    assert commands.calls[0][1]["timeout"] == sent

@@ -813,11 +813,13 @@ class AgentSandboxBackend(SandboxBackendProtocol):
                 )
             parts = ["grep", "-rHnFZ"]
             parts.extend(["-e", shlex.quote(pattern), shlex.quote(internal_path)])
-            run_kwargs: dict[str, Any] = {}
-            if self._default_timeout_seconds is not None:
-                run_kwargs["timeout"] = self._default_timeout_seconds
+            # End before DeepAgents' 35-second async grep deadline. Its wrapper
+            # abandons a slower call without closing the request; only a request
+            # that ends lets the runtime stop the search, which otherwise keeps
+            # the runtime's single command slot and every later command waits.
+            command_timeout = min(30, self._default_timeout_seconds or 30)
             try:
-                result = _run_command(sandbox, " ".join(parts), **run_kwargs)
+                result = _run_command(sandbox, " ".join(parts), timeout=command_timeout)
             except SandboxNotFoundError:
                 raise
             except Exception as error:
